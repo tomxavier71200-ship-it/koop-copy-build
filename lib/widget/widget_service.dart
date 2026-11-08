@@ -23,7 +23,7 @@ class WidgetService {
   /// Fallback App Group id. iOS builds read the configured value from Info.plist.
   static const String fallbackAppGroupId = String.fromEnvironment(
     'APP_GROUP_IDENTIFIER',
-    defaultValue: 'group.com.example.openstrap',
+    defaultValue: 'group.wtf.openstrap.koopcopy',
   );
   static String appGroupId = fallbackAppGroupId;
 
