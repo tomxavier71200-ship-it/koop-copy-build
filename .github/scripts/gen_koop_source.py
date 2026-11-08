@@ -47,17 +47,17 @@ def main() -> None:
     now = datetime.datetime.now(datetime.timezone.utc)
 
     source = {
-        "name": "Koop",
+        "name": "KOOP COPY",
         "identifier": f"{bundle_id}.koop-source",
         "news": [],
         "apps": [{
-            "name": "Koop",
+            "name": "KOOP COPY",
             "bundleIdentifier": bundle_id,
-            "developerName": "Koop",
+            "developerName": "KOOP COPY",
             "subtitle": "Your WHOOP band, no subscription",
             # SideStore refuses a source without an icon. The app's own 1024 px
             # icon, from this branch.
-            "iconURL": (f"https://raw.githubusercontent.com/{repo}/whoop-ui/"
+            "iconURL": (f"https://raw.githubusercontent.com/{repo}/main/"
                         "ios/Runner/Assets.xcassets/AppIcon.appiconset/"
                         "Icon-App-1024x1024@1x.png"),
             "tintColor": "#1E9BFF",
@@ -71,13 +71,13 @@ def main() -> None:
             # decode those rather than `versions`.
             "version": version,
             "versionDate": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "versionDescription": f"Koop {version} (build {build}).",
+            "versionDescription": f"KOOP COPY {version} (build {build}).",
             "downloadURL": url,
             "versions": [{
                 "version": version,
                 "buildVersion": build,
                 "date": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "localizedDescription": f"Koop {version} (build {build}).",
+                "localizedDescription": f"KOOP COPY {version} (build {build}).",
                 "downloadURL": url,
                 "size": size,
                 "minOSVersion": min_os,
