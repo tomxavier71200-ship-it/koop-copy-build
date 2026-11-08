@@ -1,0 +1,587 @@
+// Profile.
+//
+// Reached from the Home avatar, never a sixth tab — the shell has five
+// destinations and the type system says so.
+//
+// The reference design had a Premium badge and a Following/Followers pair.
+// Both are gone, and not for lack of screen space: there is no account and no
+// social graph, so a follower count would have to be invented and a premium
+// tier would have to be sold. What replaces them is what this app actually
+// knows — how much it has measured, and from what.
+
+import 'package:flutter/material.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
+import 'package:provider/provider.dart';
+
+import '../../cloud/cloud_sync.dart';
+import '../../health/health_import_state.dart' show storeName;
+import '../../l10n/app_localizations.dart';
+import '../../state/app_state.dart';
+import '../../state/locale_controller.dart';
+import '../ui2.dart';
+import '../screens/coach.dart' show CoachSetup, coachSubtitle;
+import 'app_health.dart' show AppHealthScreen;
+import 'whoop_compare.dart' show WhoopCompareScreen;
+import 'data.dart' show DataScreen;
+import 'devices.dart';
+import 'settings.dart';
+
+// ══════════════════ shared list furniture ══════════════════
+
+/// One row in a settings list. Shared by all three profile screens.
+class SetRow extends StatelessWidget {
+  final IconData? icon;
+  final Color color;
+  final String title, sub, value;
+  final bool danger, chevron;
+  final VoidCallback? onTap;
+  final bool? toggleValue;
+
+  /// A brand mark in place of [icon] — Lucide has no GitHub/Discord/Reddit
+  /// logo, and a generic glyph standing in for one of those is worse than
+  /// the extra param. Sized and tinted the same as the [Icon] it replaces.
+  final Widget Function(Color tint)? glyph;
+
+  const SetRow(
+    IconData this.icon,
+    this.color,
+    this.title, {
+    super.key,
+    this.sub = '',
+    this.value = '',
+    this.danger = false,
+    this.chevron = true,
+    this.onTap,
+  }) : glyph = null,
+       toggleValue = null;
+
+  const SetRow.brand(
+    this.glyph,
+    this.color,
+    this.title, {
+    super.key,
+    this.sub = '',
+    this.value = '',
+    this.danger = false,
+    this.chevron = true,
+    this.onTap,
+  }) : icon = null,
+       toggleValue = null;
+
+  /// Binary preferences expose their state and action as one switch to
+  /// VoiceOver/TalkBack, whether the user taps the label or the control.
+  const SetRow.toggle(
+    IconData this.icon,
+    this.color,
+    this.title, {
+    super.key,
+    this.sub = '',
+    required bool value,
+    this.onTap,
+  }) : toggleValue = value,
+       value = '',
+       danger = false,
+       chevron = false,
+       glyph = null;
+
+  @override
+  Widget build(BuildContext c) {
+    final p = P.of(c);
+    final accent = danger ? C.red : color;
+    final label = [
+      title,
+      if (sub.isNotEmpty) sub,
+      if (value.isNotEmpty) value,
+    ].join('. ');
+    final row = LayoutBuilder(
+      builder: (c, constraints) {
+        final stackValue = bigText(c) || constraints.maxWidth < S.tap * 7;
+        final stackToggle = toggleValue != null && stackValue;
+        Widget toggle() => ExcludeSemantics(
+          child: Switch.adaptive(
+            value: toggleValue!,
+            activeTrackColor: p.fill(accent),
+            onChanged: onTap == null ? null : (_) => onTap!(),
+          ),
+        );
+        return Pressable(
+          onTap: onTap,
+          semanticLabel: toggleValue == null ? label : null,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: S.x4),
+            child: Row(
+              children: [
+                Container(
+                  width: 36,
+                  height: 36,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    borderRadius: R.rMd,
+                    color: Look.whoop && !danger ? p.card2 : p.wash(accent),
+                  ),
+                  child: glyph != null
+                      ? glyph!(Look.whoop && !danger ? p.ink2 : p.on(accent))
+                      : Icon(icon, size: 19,
+                          color: Look.whoop && !danger ? p.ink2 : p.on(accent)),
+                ),
+                const SizedBox(width: S.x3),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: F.settingsTitle.copyWith(
+                          color: danger ? p.on(C.red) : p.ink,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      if (value.isNotEmpty && stackValue)
+                        Text(
+                          value,
+                          style: F.cap.copyWith(
+                            color: p.ink3,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      if (sub.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 2),
+                          child: Text(
+                            sub,
+                            style: F.cap.copyWith(color: p.ink3),
+                          ),
+                        ),
+                      if (stackToggle) toggle(),
+                    ],
+                  ),
+                ),
+                // THE ROW RULE (see MetricRow): the title is the only flexible part,
+                // so every value in a settings list ends on one right edge. Two flex
+                // children would split the width by ratio and break that column.
+                // The value moves UNDER the title at accessibility sizes instead —
+                // "2026-08-16 04:12" is arbitrary-length, and at 3.1× it pushed
+                // itself and the chevron off the right of every settings screen.
+                if (value.isNotEmpty && !stackValue) ...[
+                  const SizedBox(width: S.x2),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 112),
+                    child: Text(
+                      value,
+                      textAlign: TextAlign.end,
+                      style: F.cap.copyWith(color: p.ink3),
+                    ),
+                  ),
+                ],
+                if (toggleValue != null && !stackToggle) ...[
+                  const SizedBox(width: S.x2),
+                  toggle(),
+                ],
+                if (chevron && !danger) ...[
+                  const SizedBox(width: S.x2),
+                  Icon(LucideIcons.chevronRight, size: 17, color: p.ink3),
+                ],
+              ],
+            ),
+          ),
+        );
+      },
+    );
+    if (toggleValue == null) return row;
+    return Semantics(
+      container: true,
+      label: label,
+      toggled: toggleValue,
+      enabled: onTap != null,
+      onTap: onTap,
+      child: ExcludeSemantics(child: row),
+    );
+  }
+}
+
+/// A titled card of [SetRow]s, hairline-separated.
+Widget settingsGroup(BuildContext c, String title, List<Widget> rows) {
+  final p = P.of(c);
+  return Padding(
+    padding: EdgeInsets.only(bottom: Look.compact ? S.x4 : S.x6),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(left: S.x1, bottom: S.x2),
+          child: Semantics(
+            header: true,
+            child: Text(
+              title.toUpperCase(),
+              semanticsLabel: title,
+              style: (Look.whoop ? F.section : F.over)
+                  .copyWith(color: p.ink2),
+            ),
+          ),
+        ),
+        Surface(
+          pad: const EdgeInsets.symmetric(horizontal: S.x4),
+          child: Column(
+            children: [
+              for (var i = 0; i < rows.length; i++) ...[
+                rows[i],
+                if (i < rows.length - 1)
+                  Divider(color: p.line, height: 1, indent: S.x12),
+              ],
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+/// Push a screen, keeping the enclosing domain accent. Returns when it pops,
+/// so a caller whose own numbers the pushed screen can change is able to
+/// re-read them.
+Future<void> goto(BuildContext c, Widget w) =>
+    Navigator.of(c).push(MaterialPageRoute<void>(builder: (_) => w));
+
+/// The one way into the profile stack. Home's avatar calls this — profile is
+/// a pushed route, never a sixth tab.
+void openProfile(BuildContext c) => goto(c, const ProfileHome());
+
+/// Display name for a language code, sourced from a small hardcoded table.
+/// Add a row here when a contributor's `app_<code>.arb` lands — nothing else
+/// to touch; the picker below only ever offers what [AppLocalizations]
+/// actually has translations for.
+const Map<String, String> _kLanguageNames = {
+  'en': 'English',
+  'es': 'Español',
+  'fr': 'Français',
+  'de': 'Deutsch',
+  'zh': '中文',
+  'hi': 'हिन्दी',
+};
+
+String _languageLabel(BuildContext c, String? code) => code == null
+    ? (AppLocalizations.of(c)?.languageSystemDefault ?? 'System default')
+    : (_kLanguageNames[code] ?? code);
+
+Future<void> _pickLanguage(BuildContext c) async {
+  final p = P.of(c);
+  final ctrl = c.read<LocaleController>();
+  final options = <String?>[null, ...AppLocalizations.supportedLocales.map((l) => l.languageCode)];
+  await showModalBottomSheet<void>(
+    context: c,
+    sheetAnimationStyle: sheetMotion(c),
+    backgroundColor: p.card,
+    showDragHandle: true,
+    builder: (sheet) => SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (final code in options)
+            ListTile(
+              title: Text(_languageLabel(sheet, code), style: F.body.copyWith(color: p.ink)),
+              trailing: ctrl.code == code
+                  ? Icon(LucideIcons.check, size: 18, color: p.on(C.blue))
+                  : null,
+              onTap: () async {
+                await ctrl.setCode(code);
+                if (sheet.mounted) Navigator.of(sheet).pop();
+              },
+            ),
+        ],
+      ),
+    ),
+  );
+}
+
+/// Human-readable byte size. No dependency for four lines of arithmetic.
+String formatBytes(int b) {
+  if (b < 1024) return '$b B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  var v = b / 1024;
+  var i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return '${v < 10 ? v.toStringAsFixed(1) : v.round()} ${units[i]}';
+}
+
+// ══════════════════ 1 · PROFILE HOME ══════════════════
+
+/// What the profile screen still shows: who you are, how many sources are
+/// live, and how much room the data takes.
+///
+/// The workouts / records / days / sessions counters are gone with the tile
+/// that displayed them. They cost a `getRecords()` and a whole year-of-workouts
+/// query on every open, so leaving the fields behind would have kept paying for
+/// numbers nobody reads.
+class ProfileStats {
+  final String? name;
+  final int sources;
+  final int? storageBytes;
+
+  const ProfileStats({this.name, this.sources = 0, this.storageBytes});
+}
+
+class ProfileHome extends StatefulWidget {
+  const ProfileHome({super.key});
+
+  @override
+  State<ProfileHome> createState() => _ProfileHomeState();
+}
+
+class _ProfileHomeState extends State<ProfileHome> {
+  /// Re-read after every screen this one pushes. It used to be a single
+  /// `late final` Future, so pairing a band from My sources (which auto-pops
+  /// straight back here) left the row reading "0 sources", and an import or a
+  /// reset left Storage on the old size until the screen was left and
+  /// re-entered.
+  late Future<ProfileStats> _stats = _load();
+
+  Future<ProfileStats> _load() async {
+    final app = context.read<AppState>();
+    final repo = app.repo;
+    final sources = liveSources(app).length;
+    if (repo == null) {
+      return ProfileStats(
+          name: app.user?['name'] as String?, sources: sources);
+    }
+    final bytes = await app.dataFileBytes();
+    return ProfileStats(
+      name: app.user?['name'] as String?,
+      sources: sources,
+      storageBytes: bytes,
+    );
+  }
+
+  Future<void> _open(BuildContext c, Widget w) async {
+    await goto(c, w);
+    if (mounted) setState(() => _stats = _load());
+  }
+
+  @override
+  Widget build(BuildContext c) => FutureBuilder<ProfileStats>(
+        future: _stats,
+        builder: (c, snap) => ProfileHomeView(
+          stats: snap.data,
+          onDevices: () => _open(c, const MyDevices()),
+          onSettings: () => _open(c, const MoreSettings()),
+          onEdit: () => _open(c, const EditProfile()),
+          onCoach: () => _open(c, const CoachSetup()),
+          onCloud: () => _open(c, const DataScreen()),
+          onHealth: () => _open(c, const AppHealthScreen()),
+          onCompare: () => _open(c, const WhoopCompareScreen()),
+        ),
+      );
+}
+
+class ProfileHomeView extends StatelessWidget {
+  /// Null while the counts are still being read — the numbers are absent, not
+  /// zero, and a zero rendered during a load is a wrong number on screen.
+  final ProfileStats? stats;
+  final VoidCallback? onDevices, onSettings, onEdit, onCoach, onCloud,
+      onHealth, onCompare;
+
+  const ProfileHomeView(
+      {super.key,
+      this.stats,
+      this.onDevices,
+      this.onCoach,
+      this.onCloud,
+      this.onHealth,
+      this.onCompare,
+      this.onSettings,
+      this.onEdit,
+      });
+
+  @override
+  Widget build(BuildContext c) {
+    final p = P.of(c);
+    final l = AppLocalizations.of(c);
+    final s = stats;
+    return Scaffold(
+      backgroundColor: p.bg,
+      body: SafeArea(
+        child: Column(children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: S.x4),
+            child: NavBar(l?.profileTitle ?? 'Profile'),
+          ),
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(S.x4, 0, S.x4, S.x10),
+              children: [
+                const SizedBox(height: S.x4),
+                _ProfileHero(stats: s, onEdit: onEdit),
+                const SizedBox(height: S.x5),
+                settingsGroup(c, l?.profileQuickAccessGroup ?? 'Quick access', [
+                  SetRow(LucideIcons.watch, C.blue,
+                      l?.profileMyDevices ?? 'My devices',
+                      sub: s == null
+                          ? ''
+                          : (l?.profileSourcesCount(s.sources) ??
+                              '${s.sources} source${s.sources == 1 ? '' : 's'}'),
+                      onTap: onDevices),
+                  SetRow(LucideIcons.userPen, C.purple,
+                      l?.profileEditProfile ?? 'Edit profile',
+                      sub: l?.profileEditProfileSub ??
+                          'Sex, age, height, weight',
+                      onTap: onEdit),
+                  // THE ONLY DOOR TO THE COACH'S SETUP, and it has to be —
+                  // Home's sparkles button is now gated on `coachReady`, so on
+                  // a fresh install there is no icon to find it behind. It
+                  // belongs here anyway: a model, a base URL and a key are
+                  // settings, and the coach's own overflow menu offering the
+                  // same form was two doors onto one state.
+                  //
+                  // `watch` rather than `read` so the sub-line stops saying
+                  // "Not set up" the moment it is.
+                  Builder(builder: (c) => SetRow(
+                      LucideIcons.sparkles, C.purple,
+                      AppLocalizations.of(c)?.profileAiCoach ?? 'AI coach',
+                      sub: coachSubtitle(c) ??
+                          (AppLocalizations.of(c)?.profileNotSetUp ??
+                              'Not set up'),
+                      onTap: onCoach)),
+                  Builder(builder: (c) => SetRow(
+                      LucideIcons.languages, C.blue,
+                      AppLocalizations.of(c)?.profileLanguage ?? 'Language',
+                      sub: _languageLabel(c, c.watch<LocaleController>().code),
+                      onTap: () => _pickLanguage(c))),
+                ]),
+                settingsGroup(c, l?.profileYourDataGroup ?? 'Your data', [
+                  SetRow(LucideIcons.heartPulse, C.green, 'App health',
+                      sub: 'Is the band syncing, did last night sync, battery, '
+                          'cloud',
+                      onTap: onHealth),
+                  SetRow(LucideIcons.gitCompare, C.blue, 'Koop vs WHOOP',
+                      sub: 'Your nights side by side with a WHOOP export',
+                      onTap: onCompare),
+                  // Koop Cloud: signed in or not, and how fresh — the same
+                  // line More shows, opening the same screen.
+                  ListenableBuilder(
+                    listenable: CloudSync.instance,
+                    builder: (c, _) {
+                      final cs = CloudSync.instance;
+                      return SetRow(LucideIcons.cloud, C.teal, 'Koop Cloud',
+                          sub: !cs.on
+                              ? 'Sign in with Google to use Koop on more phones'
+                              : cs.busy
+                                  ? 'Syncing…'
+                                  : cs.lastError ??
+                                      cloudAgo(cs.role == CloudRole.send
+                                          ? cs.lastUp
+                                          : cs.remoteSeen),
+                          onTap: onCloud);
+                    },
+                  ),
+                  SetRow(LucideIcons.database, C.green,
+                      l?.profileStorage ?? 'Storage',
+                      value: s?.storageBytes == null
+                          ? ''
+                          : formatBytes(s!.storageBytes!),
+                      chevron: false),
+                  SetRow(LucideIcons.settings, C.n500,
+                      l?.profileMoreSettings ?? 'More settings',
+                      // `From $storeName` used to sit on Quick access too. It
+                      // came off: height, weight and workouts already moved to
+                      // the screens they fill, and what is left — a resting
+                      // heart rate the app does not use yet, plus readings from
+                      // instruments this band does not have — is not quick and
+                      // is not accessed often. It keeps its one door here, and
+                      // this line names it so the door is findable.
+                      sub: l?.profileMoreSettingsSub(storeName) ??
+                          'Import from $storeName, export, backup, units, '
+                              'privacy, reset',
+                      onTap: onSettings),
+                ]),
+                // Koop's own source, and the project it is built on — named
+                // because the MIT licence asks for it, not as a community door.
+                settingsGroup(c, 'About Koop', [
+                  SetRow.brand(brandGlyph('assets/icons/github.svg'), C.n500,
+                      'Source code',
+                      sub: 'Koop is open source, built on OpenStrap edge '
+                          '(MIT licence)',
+                      onTap: () => open3rdPartyLink(kGithubUrl)),
+                ]),
+              ],
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+
+}
+
+/// Identity and measurement status in one calm header. The old screen opened
+/// directly into a wall of settings rows, so Profile had no visual hierarchy
+/// and the user's own name was loaded but never shown.
+class _ProfileHero extends StatelessWidget {
+  final ProfileStats? stats;
+  final VoidCallback? onEdit;
+
+  const _ProfileHero({required this.stats, this.onEdit});
+
+  @override
+  Widget build(BuildContext c) {
+    final p = P.of(c);
+    final s = stats;
+    final name = s?.name?.trim();
+    final shownName = name == null || name.isEmpty ? 'Your Koop' : name;
+    final initial = name == null || name.isEmpty
+        ? null
+        : name.characters.first.toUpperCase();
+    final sources = s?.sources;
+    final status = sources == null
+        ? 'Reading your profile…'
+        : sources == 0
+            ? 'No measurement source connected'
+            : '$sources measurement source${sources == 1 ? '' : 's'} connected';
+    final heading = Text(shownName,
+        maxLines: bigText(c) ? null : 2,
+        overflow: TextOverflow.ellipsis,
+        style: F.t2.copyWith(color: p.ink));
+    final details = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(status, style: F.cap.copyWith(color: p.ink3)),
+        if (s?.storageBytes != null) ...[
+          const SizedBox(height: S.x2),
+          Text('${formatBytes(s!.storageBytes!)} stored on this phone',
+              style: F.over.copyWith(color: p.ink2)),
+        ],
+      ],
+    );
+    final avatar = Container(
+      width: S.x16,
+      height: S.x16,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(shape: BoxShape.circle, color: p.wash(C.blue)),
+      child: initial == null
+          ? Icon(LucideIcons.user, size: 26, color: p.on(C.blue))
+          : FittedBox(fit: BoxFit.scaleDown,
+              child: Text(initial, style: F.n34.copyWith(
+                  color: p.on(C.blue), fontWeight: FontWeight.w700))),
+    );
+    final identity = Row(children: [
+      avatar,
+      const SizedBox(width: S.x4),
+      Expanded(child: bigText(c) ? heading : Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [heading, const SizedBox(height: S.x1), details],
+      )),
+      const SizedBox(width: S.x2),
+      Icon(LucideIcons.chevronRight, size: 18, color: p.ink3),
+    ]);
+    return Surface(
+      onTap: onEdit,
+      semanticLabel: '$shownName. $status. Edit profile',
+      pad: const EdgeInsets.all(S.x5),
+      child: bigText(c) ? Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [identity, const SizedBox(height: S.x3), details],
+      ) : identity,
+    );
+  }
+}

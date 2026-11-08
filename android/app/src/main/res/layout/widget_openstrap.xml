@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+  The wide face, WHOOP-style: a header (streak · KOOP · band battery), then
+  Sleep · Recovery · Strain as three dials with the number inside and the name
+  under it. Every string and every colour is set at render time; nothing here
+  decides what a metric means.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:paddingStart="14dp"
+    android:paddingEnd="14dp"
+    android:paddingTop="10dp"
+    android:paddingBottom="12dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:id="@+id/hdr_streak"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:textSize="13sp"
+            android:textStyle="bold"
+            android:maxLines="1" />
+
+        <TextView
+            android:id="@+id/hdr_brand"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="KOOP"
+            android:textSize="13sp"
+            android:letterSpacing="0.35"
+            android:maxLines="1" />
+
+        <TextView
+            android:id="@+id/hdr_battery"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="end"
+            android:textSize="13sp"
+            android:textStyle="bold"
+            android:maxLines="1" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="6dp"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center_horizontal">
+
+            <FrameLayout
+                android:layout_width="68dp"
+                android:layout_height="68dp">
+
+                <ImageView
+                    android:id="@+id/dial_sleep"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:importantForAccessibility="no" />
+
+                <TextView
+                    android:id="@+id/val_sleep"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:gravity="center"
+                    android:paddingStart="9dp"
+                    android:paddingEnd="9dp"
+                    android:autoSizeTextType="uniform"
+                    android:autoSizeMinTextSize="10sp"
+                    android:autoSizeMaxTextSize="18sp"
+                    android:autoSizeStepGranularity="1sp"
+                    android:textSize="18sp"
+                    android:textStyle="bold"
+                    android:maxLines="1" />
+            </FrameLayout>
+
+            <TextView
+                android:id="@+id/cap_sleep"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textSize="10sp"
+                android:textStyle="bold"
+                android:letterSpacing="0.12"
+                android:maxLines="1" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center_horizontal">
+
+            <FrameLayout
+                android:layout_width="68dp"
+                android:layout_height="68dp">
+
+                <ImageView
+                    android:id="@+id/dial_recovery"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:importantForAccessibility="no" />
+
+                <TextView
+                    android:id="@+id/val_recovery"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:gravity="center"
+                    android:paddingStart="9dp"
+                    android:paddingEnd="9dp"
+                    android:autoSizeTextType="uniform"
+                    android:autoSizeMinTextSize="10sp"
+                    android:autoSizeMaxTextSize="18sp"
+                    android:autoSizeStepGranularity="1sp"
+                    android:textSize="18sp"
+                    android:textStyle="bold"
+                    android:maxLines="1" />
+            </FrameLayout>
+
+            <TextView
+                android:id="@+id/cap_recovery"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textSize="10sp"
+                android:textStyle="bold"
+                android:letterSpacing="0.12"
+                android:maxLines="1" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center_horizontal">
+
+            <FrameLayout
+                android:layout_width="68dp"
+                android:layout_height="68dp">
+
+                <ImageView
+                    android:id="@+id/dial_strain"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:importantForAccessibility="no" />
+
+                <TextView
+                    android:id="@+id/val_strain"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:gravity="center"
+                    android:paddingStart="9dp"
+                    android:paddingEnd="9dp"
+                    android:autoSizeTextType="uniform"
+                    android:autoSizeMinTextSize="10sp"
+                    android:autoSizeMaxTextSize="18sp"
+                    android:autoSizeStepGranularity="1sp"
+                    android:textSize="18sp"
+                    android:textStyle="bold"
+                    android:maxLines="1" />
+            </FrameLayout>
+
+            <TextView
+                android:id="@+id/cap_strain"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textSize="10sp"
+                android:textStyle="bold"
+                android:letterSpacing="0.12"
+                android:maxLines="1" />
+        </LinearLayout>
+    </LinearLayout>
+</LinearLayout>

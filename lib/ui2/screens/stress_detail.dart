@@ -1,0 +1,502 @@
+// The Stress Monitor's day view, WHOOP-style: the readings as a
+// line coloured by level, sleep and workouts marked on it, and the time spent
+// at each level — for the whole day, outside activities, and during sleep —
+// against the same weekday's usual.
+//
+// Arithmetic on the readings the pipeline already wrote (`stress_day`, heart
+// rate above resting per 5 minutes — 15 before algo 111 — 0–100, shown 0–3).
+// Nothing here is a new stress number. Each reading counts as its own
+// length; a window without a reading counts as nothing, never as calm.
+
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
+
+import '../../data/day_label.dart';
+import '../grammar.dart';
+import '../theme.dart';
+import 'health_screen.dart' show kStressLevelColors, kStressLevelWords, stressLevelOf;
+import 'detail_trends.dart' show hmOfMin;
+import 'home_screen.dart' show clock;
+
+/// One reading on the 0–3 scale, and the minutes it covers (5, or 15 on
+/// days derived before algo 111).
+typedef StressReading = ({DateTime at, double v, int min});
+
+/// Minutes of scored readings today before any screen states a stress LEVEL
+/// for the day (Home's tile, the Health stress gauge). A level on twenty
+/// minutes is the thin-data stress reading AGENTS §4.1 calls out, so it
+/// waits for an hour. The individual readings still draw as what they are.
+const kStressMinMinutes = 60;
+
+/// The minutes [r] covers.
+int stressMinutes(Iterable<StressReading> r) =>
+    r.fold(0, (a, x) => a + x.min);
+
+/// Enough readings to state a level: [kStressMinMinutes].
+bool stressEnough(Iterable<StressReading> r) =>
+    stressMinutes(r) >= kStressMinMinutes;
+
+/// WHOOP's stress scale from 0 to 3: blue, teal, green, yellow, orange. The
+/// line and the dial shade along it rather than jumping at the level cuts.
+const kStressScale = [C.blue, C.teal, C.green, C.yellow, C.orange];
+
+/// The colour of [v] (0–3) on [kStressScale].
+Color stressShade(double v) {
+  final f = (v / 3).clamp(0.0, 1.0) * (kStressScale.length - 1);
+  final i = f.floor().clamp(0, kStressScale.length - 2);
+  return Color.lerp(kStressScale[i], kStressScale[i + 1], f - i)!;
+}
+
+/// A span the day's timeline marks: sleep, or a workout.
+typedef Span = ({int from, int to});
+
+/// Today's readings from a `getDayStress` map, on the 0–3 scale, for [day].
+List<StressReading> stressReadings(Map<String, dynamic> s, String day) => [
+      for (final e in (s['stress_day'] is List ? s['stress_day'] as List : const []))
+        if (e is Map && e['t'] is num && e['score'] is num)
+          if (DateTime.fromMillisecondsSinceEpoch((e['t'] as num).toInt() * 1000)
+              case final at when dayLabelOf(at) == day)
+            (
+              at: at,
+              v: (e['score'] as num).toDouble() / 100 * 3,
+              min: e['sec'] is num ? (e['sec'] as num).toInt() ~/ 60 : 15,
+            ),
+    ];
+
+/// Sleep and workout spans from a `getDayTimeline` map, epoch seconds.
+({List<Span> sleep, List<Span> work}) timelineSpans(Map<String, dynamic> t) {
+  Span? span(Object? a, Object? b) =>
+      a is num && b is num && b > a ? (from: a.toInt(), to: b.toInt()) : null;
+  return (
+    sleep: [
+      for (final s in (t['sleep'] as List? ?? const []))
+        if (s is Map) ?span(s['onset_ts'], s['wake_ts']),
+    ],
+    work: [
+      for (final w in (t['sessions'] as List? ?? const []))
+        if (w is Map) ?span(w['start_ts'], w['end_ts']),
+    ],
+  );
+}
+
+/// Minutes at Low / Medium / High: the whole day, outside sleep and
+/// workouts, and during sleep. A reading belongs to a span when its window
+/// starts inside it.
+class StressSplit {
+  final List<int> total, outside, asleep;
+  const StressSplit(this.total, this.outside, this.asleep);
+
+  List<int> of(int part) => [total, outside, asleep][part];
+}
+
+StressSplit stressSplit(List<StressReading> r,
+    {List<Span> sleep = const [], List<Span> work = const []}) {
+  final total = [0, 0, 0], outside = [0, 0, 0], asleep = [0, 0, 0];
+  bool inside(List<Span> spans, int t) =>
+      spans.any((s) => t >= s.from && t < s.to);
+  for (final x in r) {
+    final lvl = stressLevelOf(x.v);
+    final t = x.at.millisecondsSinceEpoch ~/ 1000;
+    total[lvl] += x.min;
+    if (inside(sleep, t)) {
+      asleep[lvl] += x.min;
+    } else if (!inside(work, t)) {
+      outside[lvl] += x.min;
+    }
+  }
+  return StressSplit(total, outside, asleep);
+}
+
+/// The evening summary's line: "1:15 at high stress and 3:20 at medium
+/// today. It peaked at 2.4 around 14:30." Null under [kStressMinMinutes] of
+/// readings — a thin day gets no summary.
+String? stressSummaryText(List<StressReading> r) {
+  if (!stressEnough(r)) return null;
+  final t = stressSplit(r).total;
+  final peak = r.reduce((a, b) => b.v > a.v ? b : a);
+  return '${hmOfMin(t[2].toDouble())} at high stress and ${hmOfMin(t[1].toDouble())} at medium '
+      'today. It peaked at ${peak.v.toStringAsFixed(1)} around '
+      '${clock(peak.at.hour * 60 + peak.at.minute)}.';
+}
+
+/// The usual day: the mean of each bucket over [days]. Null under two days —
+/// one earlier Friday is an anecdote, not a typical Friday.
+StressSplit? typicalSplit(List<StressSplit> days) {
+  if (days.length < 2) return null;
+  List<int> mean(int part) => [
+        for (var i = 0; i < 3; i++)
+          (days.map((d) => d.of(part)[i]).reduce((a, b) => a + b) / days.length)
+              .round(),
+      ];
+  return StressSplit(mean(0), mean(1), mean(2));
+}
+
+/// Change against the usual, in percent; null when there is no usual or the
+/// usual is zero (a percentage of nothing is not a number).
+int? changePct(int now, int? usual) =>
+    usual == null || usual == 0 ? null : ((now - usual) / usual * 100).round();
+
+const _weekdays = [
+  'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday', //
+];
+String weekdayName(DateTime d) => _weekdays[d.weekday - 1];
+
+/// The day's readings as a line, coloured by level, sleep shaded and workouts
+/// marked above. Gaps where there is no reading.
+class StressLine extends StatelessWidget {
+  final List<StressReading> readings;
+  final List<Span> sleep, work;
+  final DateTime day;
+
+  /// An optional window narrower than the day — the sleep screen draws the
+  /// night only. Null draws midnight to midnight.
+  final DateTime? from, to;
+
+  /// The reading a finger picked (Stress Monitor): a line and a ring on it.
+  final StressReading? selected;
+
+  /// A dashed line at the right edge: the window ends now.
+  final bool markEnd;
+
+  /// The plot's height; the Stress Monitor draws it tall, as WHOOP does.
+  final double height;
+  const StressLine(
+      {super.key,
+      required this.readings,
+      required this.sleep,
+      required this.work,
+      required this.day,
+      this.from,
+      this.to,
+      this.selected,
+      this.markEnd = false,
+      this.height = 150});
+
+  /// Five evenly spaced clock labels over the drawn window.
+  List<String> _labels() {
+    final a = from, b = to;
+    if (a == null || b == null) {
+      return const ['00:00', '06:00', '12:00', '18:00', '24:00'];
+    }
+    final span = b.difference(a).inSeconds;
+    return [
+      for (var i = 0; i <= 4; i++)
+        () {
+          final t = DateTime.fromMillisecondsSinceEpoch(
+              a.millisecondsSinceEpoch + span * 1000 * i ~/ 4);
+          return '${t.hour.toString().padLeft(2, '0')}:'
+              '${t.minute.toString().padLeft(2, '0')}';
+        }(),
+    ];
+  }
+
+  @override
+  Widget build(BuildContext c) {
+    final p = P.of(c);
+    return Semantics(
+      label: 'Stress through the day, ${readings.length} readings',
+      child: Column(children: [
+        SizedBox(
+          height: height,
+          child: CustomPaint(
+            size: Size.infinite,
+            painter: _LinePainter(readings, sleep, work, day, p, from, to, selected, markEnd),
+          ),
+        ),
+        const SizedBox(height: S.x2),
+        Padding(
+          padding: const EdgeInsets.only(left: 26),
+          // Each label owns a fifth of the width and shrinks inside it at
+          // large text, rather than the row running off the card.
+          child: Row(children: [
+            for (final (i, t) in _labels().indexed)
+              Expanded(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: i == 0
+                      ? Alignment.centerLeft
+                      : i == 4
+                          ? Alignment.centerRight
+                          : Alignment.center,
+                  child: Text(t, style: F.over.copyWith(color: p.ink3)),
+                ),
+              ),
+          ]),
+        ),
+      ]),
+    );
+  }
+}
+
+class _LinePainter extends CustomPainter {
+  final List<StressReading> r;
+  final List<Span> sleep, work;
+  final DateTime day;
+  final P p;
+  final DateTime? from, to;
+  final StressReading? sel;
+  final bool markEnd;
+  _LinePainter(this.r, this.sleep, this.work, this.day, this.p,
+      [this.from, this.to, this.sel, this.markEnd = false]);
+
+  @override
+  void paint(Canvas cv, Size s) {
+    const left = 26.0, top = 26.0;
+    final w = s.width - left, h = s.height - top;
+    final start = from ?? DateTime(day.year, day.month, day.day);
+    final end = to ?? DateTime(day.year, day.month, day.day + 1);
+    final spanSec = end.difference(start).inSeconds.toDouble();
+    double x(int sec) =>
+        left + w * ((sec - start.millisecondsSinceEpoch ~/ 1000) / spanSec).clamp(0.0, 1.0);
+    double y(double v) => top + h * (1 - (v / 3).clamp(0.0, 1.0));
+
+    final grid = Paint()
+      ..color = p.line
+      ..strokeWidth = 1;
+    for (final v in [0, 1, 2, 3]) {
+      cv.drawLine(Offset(left, y(v.toDouble())), Offset(s.width, y(v.toDouble())), grid);
+      final tp = TextPainter(
+          text: TextSpan(text: '$v.0', style: F.over.copyWith(color: p.ink3)),
+          textDirection: TextDirection.ltr)
+        ..layout();
+      tp.paint(cv, Offset(0, y(v.toDouble()) - tp.height / 2));
+    }
+    // A moon over each sleep and a pulse over each workout, centred on the
+    // span's mark, as WHOOP labels its day chart.
+    void icon(IconData i, Span sp, Color col) {
+      final tp = TextPainter(
+          text: TextSpan(
+              text: String.fromCharCode(i.codePoint),
+              style: F.cap.copyWith(
+                  fontFamily: i.fontFamily, package: i.fontPackage, color: col)),
+          textDirection: TextDirection.ltr)
+        ..layout();
+      final cx = (x(sp.from) + x(sp.to)) / 2;
+      tp.paint(cv, Offset((cx - tp.width / 2).clamp(left, s.width - tp.width), 0));
+    }
+
+    // Sleep, shaded; workouts as a mark above the chart.
+    for (final sp in sleep) {
+      icon(LucideIcons.moon, sp, p.on(C.sleep));
+      cv.drawRect(Rect.fromLTRB(x(sp.from), top, x(sp.to), top + h),
+          Paint()..color = p.on(C.sleep).withValues(alpha: .10));
+      cv.drawLine(Offset(x(sp.from), top - 6), Offset(x(sp.to), top - 6),
+          Paint()
+            ..color = p.on(C.sleep)
+            ..strokeWidth = 3
+            ..strokeCap = StrokeCap.round);
+    }
+    for (final sp in work) {
+      icon(LucideIcons.activity, sp, p.on(C.strain));
+      cv.drawRect(Rect.fromLTRB(x(sp.from), top, math.max(x(sp.to), x(sp.from) + 2), top + h),
+          Paint()..color = p.on(C.strain).withValues(alpha: .14));
+      cv.drawLine(Offset(x(sp.from), top - 6),
+          Offset(math.max(x(sp.to), x(sp.from) + 4), top - 6),
+          Paint()
+            ..color = p.on(C.strain)
+            ..strokeWidth = 3
+            ..strokeCap = StrokeCap.round);
+    }
+    // The line: back-to-back readings joined, each segment shaded by its
+    // value along WHOOP's blue → green → orange scale; a gap breaks it.
+    final sorted = [...r]..sort((a, b) => a.at.compareTo(b.at));
+    for (var i = 0; i < sorted.length; i++) {
+      final a = sorted[i];
+      final ax = x(a.at.millisecondsSinceEpoch ~/ 1000), ay = y(a.v);
+      final col = p.on(stressShade(a.v));
+      if (i + 1 < sorted.length &&
+          sorted[i + 1].at.difference(a.at).inMinutes <= a.min + 5) {
+        final b = sorted[i + 1];
+        final a2 = Offset(ax, ay),
+            b2 = Offset(x(b.at.millisecondsSinceEpoch ~/ 1000), y(b.v));
+        cv.drawLine(
+            a2,
+            b2,
+            Paint()
+              ..shader = LinearGradient(
+                      colors: [col, p.on(stressShade(b.v))])
+                  .createShader(Rect.fromPoints(a2, b2 + const Offset(.1, .1)))
+              ..strokeWidth = 2
+              ..strokeCap = StrokeCap.round);
+      } else {
+        cv.drawCircle(Offset(ax, ay), 2, Paint()..color = col);
+      }
+    }
+    // Now: a dashed line down the right edge, WHOOP's "live" end.
+    if (markEnd) {
+      final dash = Paint()
+        ..color = p.ink2
+        ..strokeWidth = 1.5;
+      for (var yy = top - 8; yy < top + h; yy += 6) {
+        cv.drawLine(Offset(s.width - 1, yy), Offset(s.width - 1, math.min(yy + 3, top + h)), dash);
+      }
+      cv.drawCircle(Offset(s.width - 1, top + h), 3, Paint()..color = p.ink);
+    }
+    final pick = sel;
+    if (pick != null) {
+      final sx = x(pick.at.millisecondsSinceEpoch ~/ 1000), sy = y(pick.v);
+      cv.drawLine(Offset(sx, top), Offset(sx, top + h),
+          Paint()
+            ..color = p.ink
+            ..strokeWidth = 1);
+      cv.drawCircle(Offset(sx, sy), 5, Paint()..color = p.ink);
+      cv.drawCircle(Offset(sx, sy), 3,
+          Paint()..color = p.on(kStressLevelColors[stressLevelOf(pick.v)]));
+    }
+  }
+
+  @override
+  bool shouldRepaint(_LinePainter o) =>
+      o.r != r ||
+      o.sleep != sleep ||
+      o.work != work ||
+      o.p.dark != p.dark ||
+      o.sel != sel ||
+      o.from != from ||
+      o.to != to;
+}
+
+/// One part of the day (whole day, outside activities, sleep), WHOOP's card:
+/// the part's icon and name, "SAT, OCT 10 STRESS VS. TYPICAL SATURDAY", a
+/// thick stacked bar for the day and a thin one for the usual, the time at
+/// each level with its change, and "See trends".
+class StressSplitCard extends StatelessWidget {
+  final String title, blurb, versus;
+  final IconData? icon;
+  final List<int> today;
+  final List<int>? usual;
+  final VoidCallback? onTrends;
+  const StressSplitCard(
+      {super.key,
+      required this.title,
+      required this.blurb,
+      required this.versus,
+      required this.today,
+      this.usual,
+      this.icon,
+      this.onTrends});
+
+  /// The change chip: a percentage against a usual above zero; against a
+  /// usual of zero the plain added time (a percentage of nothing is not a
+  /// number); nothing without a usual.
+  static String? change(int now, int? usual) {
+    if (usual == null) return null;
+    final d = changePct(now, usual);
+    if (d != null) return '${d >= 0 ? '▲' : '▼'} ${d.abs()}%';
+    return now == 0 ? null : '▲ ${hmOfMin(now.toDouble())}';
+  }
+
+  @override
+  Widget build(BuildContext c) {
+    final p = P.of(c);
+    Widget stack(List<int> m, double h, double alpha) {
+      final sum = m.fold(0, (a, b) => a + b);
+      return ClipRRect(
+        borderRadius: R.rSm,
+        child: SizedBox(
+          height: h,
+          child: sum == 0
+              ? ColoredBox(color: p.track)
+              : Row(children: [
+                  for (var i = 0; i < 3; i++)
+                    if (m[i] > 0)
+                      Expanded(
+                        flex: m[i],
+                        child: Container(
+                          margin: const EdgeInsets.only(right: 2),
+                          color: p.on(kStressLevelColors[i]).withValues(alpha: alpha),
+                        ),
+                      ),
+                ]),
+        ),
+      );
+    }
+
+    return Surface(
+      semanticLabel: '$title. ${[
+        for (var i = 0; i < 3; i++)
+          '${kStressLevelWords[i]} ${hmOfMin(today[i].toDouble())}',
+      ].join(', ')}',
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          if (icon != null) ...[
+            Icon(icon, size: 18, color: p.ink3),
+            const SizedBox(width: S.x2),
+          ],
+          Expanded(
+            child: Text(title.toUpperCase(),
+                style: F.over.copyWith(
+                    color: p.ink, letterSpacing: 1.6, fontWeight: FontWeight.w700)),
+          ),
+        ]),
+        const SizedBox(height: S.x3),
+        Text(versus.toUpperCase(),
+            style: F.over.copyWith(
+                color: p.ink2, letterSpacing: 1.2, fontWeight: FontWeight.w700)),
+        const SizedBox(height: S.x3),
+        stack(today, 12, 1),
+        if (usual != null) ...[
+          const SizedBox(height: S.x2),
+          stack(usual!, 6, .45),
+        ],
+        const SizedBox(height: S.x4),
+        Row(children: [
+          for (var i = 0; i < 3; i++)
+            Expanded(
+              // A third of the card each; the column scales down at large
+              // text instead of pushing past the edge.
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                alignment: Alignment.topLeft,
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(hmOfMin(today[i].toDouble()),
+                      style: F.n24.copyWith(color: p.ink)),
+                  if (change(today[i], usual?[i]) case final d?)
+                    Container(
+                      margin: const EdgeInsets.only(top: S.x1),
+                      padding: const EdgeInsets.symmetric(horizontal: S.x2, vertical: 2),
+                      decoration: BoxDecoration(color: p.card2, borderRadius: R.rSm),
+                      child: Text(d, style: F.cap.copyWith(color: p.ink2)),
+                    ),
+                  const SizedBox(height: S.x1),
+                  Row(children: [
+                    Container(
+                        width: 8,
+                        height: 8,
+                        color: p.on(kStressLevelColors[i])),
+                    const SizedBox(width: S.x1),
+                    Text(kStressLevelWords[i].toUpperCase(),
+                        style: F.over.copyWith(color: p.ink2, letterSpacing: 1.2)),
+                  ]),
+                ]),
+              ),
+            ),
+        ]),
+        const SizedBox(height: S.x3),
+        Text(blurb, style: F.body.copyWith(color: p.ink3)),
+        if (onTrends != null) ...[
+          const SizedBox(height: S.x3),
+          Pressable(
+            onTap: onTrends,
+            semanticLabel: 'See $title trends',
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: S.x2),
+              child: Row(children: [
+                Text('SEE TRENDS',
+                    style: F.over.copyWith(
+                        color: p.ink, letterSpacing: 1.6, fontWeight: FontWeight.w700)),
+                const SizedBox(width: S.x2),
+                Icon(LucideIcons.arrowRight, size: 18, color: p.ink),
+              ]),
+            ),
+          ),
+        ],
+      ]),
+    );
+  }
+}
+
+/// "as of 14:15" for the newest reading.
+String asOf(StressReading r) => clock(r.at.hour * 60 + r.at.minute);

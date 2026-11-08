@@ -1,0 +1,616 @@
+// cloud_sync.dart — Koop Cloud: the same data on more than one phone, through
+// the person's OWN Google Drive. There is no Koop server.
+//
+// THE MODEL. One phone has the band; it SENDS. Every other phone RECEIVES. A
+// sender keeps a complete encrypted daily checkpoint and uploads cumulative
+// encrypted changes between checkpoints. A receiver authenticates and rebuilds
+// a standalone database before handing it to `importEdgeBackup`, the restore path the
+// Data screen already uses: a MERGE, so running it again with a newer copy adds
+// what is new rather than duplicating what is there.
+//
+// WHY ONE DIRECTION. Two phones both writing the same file would each overwrite
+// the other's copy; this protocol deliberately assumes one sending device.
+// The band pairs with one phone at a time anyway, so the phone holding it is the
+// only one with anything new to say.
+//
+// WHAT GOOGLE SEES: an encrypted file. The passphrase stays on the phones, in
+// the platform keystore; a forgotten passphrase means the cloud copy cannot be
+// opened — the same contract as the encrypted backup, for the same reason.
+
+import 'dart:async';
+import 'dart:convert';
+import 'package:http/http.dart' show ClientException;
+import 'dart:io';
+import 'dart:isolate';
+import 'dart:ui' show IsolateNameServer;
+
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:path_provider/path_provider.dart';
+
+import '../data/db.dart';
+import '../import/backup_crypto.dart';
+import '../state/prefs.dart';
+import '../sync/file_log.dart';
+import 'drive_api.dart';
+import 'cloud_transfer.dart';
+
+/// OAuth client ids from the Google Cloud project. Empty means Koop Cloud is
+/// not set up in this build, and the screen says exactly that instead of
+/// offering a sign-in that cannot work. Client ids are not secrets — they ship
+/// inside every app that uses Google sign-in.
+const kGoogleWebClientId =
+    '423346785849-ivk1sk3f16akkejcpb3is6h8qj67mtq7.apps.googleusercontent.com';
+const kGoogleIosClientId =
+    '423346785849-vjgqhnceg5qb1htjo2htenm0clb7h1dc.apps.googleusercontent.com';
+
+bool get cloudConfigured => kGoogleWebClientId.isNotEmpty;
+
+enum CloudRole {
+  send,
+  receive;
+
+  /// Null until the person picks one: a default of `send` let a freshly
+  /// signed-in second phone upload its empty database over the real copy.
+  static CloudRole? fromName(String? n) {
+    for (final r in CloudRole.values) {
+      if (r.name == n) return r;
+    }
+    return null;
+  }
+}
+
+const kCloudOnKey = 'cloud.on';
+const kCloudRoleKey = 'cloud.role';
+const kCloudEmailKey = 'cloud.email';
+const kCloudWifiOnlyKey = 'cloud.wifi_only';
+const kCloudLastUpKey = 'cloud.last_up'; // epoch ms, our clock
+const kCloudLastCheckKey = 'cloud.last_check'; // epoch ms, our clock
+const kCloudRemoteSeenKey = 'cloud.remote_seen'; // Drive modifiedTime, ISO
+const kCloudRemoteRevisionKey = 'cloud.remote_revision'; // full/delta identity
+const _kPassKey = 'cloud.passphrase';
+
+/// Call only after a successful upload/import. Keep the user-facing timestamp
+/// separate from the compound revision used to avoid redundant transfers.
+void rememberCloudCopy(CloudTransferResult copy) {
+  Prefs.setString(kCloudRemoteSeenKey, copy.remote.modified.toIso8601String());
+  Prefs.setString(kCloudRemoteRevisionKey, copy.revision);
+}
+
+/// The sending phone uploads changes as soon as a band sync
+/// has brought something new ([dirty]), no more often than [kCloudSendGap] so
+/// a burst of drains costs one upload; with nothing new it still re-sends once
+/// a day ([kCloudSendEvery]) as a safety copy. A receiving phone checks every
+/// [kCloudCheckEvery] — a metadata request that costs nothing when unchanged.
+const kCloudSendGap = Duration(minutes: 2);
+const kCloudSendEvery = Duration(hours: 24);
+const kCloudCheckEvery = Duration(minutes: 2);
+const kCloudDirtyKey = 'cloud.dirty';
+// The database's data mark ([LocalDb.cloudDataMark]) as of the last upload:
+// "new data" is a mark that moved, not a sync that merely ran.
+const kCloudUpMarkKey = 'cloud.up_mark';
+const _kSendLockName = 'koop.cloud.send';
+
+/// Whether a pass should do anything. Pure, for the tests.
+bool cloudDue(CloudRole role, DateTime now,
+    {DateTime? lastUp, DateTime? lastCheck, bool dirty = false}) {
+  if (role == CloudRole.receive) {
+    return lastCheck == null || now.difference(lastCheck) >= kCloudCheckEvery;
+  }
+  if (lastUp == null) return true;
+  final since = now.difference(lastUp);
+  return (dirty && since >= kCloudSendGap) || since >= kCloudSendEvery;
+}
+
+/// How long until new data on a SENDING phone may be uploaded, when it cannot
+/// go now: the rest of the [kCloudSendGap] spacing, or that gap again while an
+/// upload is already running (it read the data before this arrived). Null when
+/// there is nothing to wait for — no new data, a receiving phone, or due now.
+Duration? cloudRetryIn(CloudRole role, DateTime now,
+    {DateTime? lastUp, required bool dirty, required bool busy}) {
+  if (role != CloudRole.send || !dirty) return null;
+  if (busy) return kCloudSendGap;
+  if (lastUp == null) return null;
+  final left = kCloudSendGap - now.difference(lastUp);
+  return left > Duration.zero ? left + const Duration(seconds: 1) : null;
+}
+
+/// "Synced 3 min ago", the way WHOOP says it. [at] is the last upload (sending
+/// phone) or the newest copy merged (receiving phone); null has never synced.
+String cloudAgo(DateTime? at, [DateTime? now]) {
+  if (at == null) return 'Not synced yet';
+  final d = (now ?? DateTime.now()).difference(at);
+  if (d.inMinutes < 1) return 'Synced just now';
+  if (d.inMinutes < 60) return 'Synced ${d.inMinutes} min ago';
+  if (d.inHours < 24) return 'Synced ${d.inHours} h ago';
+  return 'Synced ${d.inDays} d ago';
+}
+
+/// Whether the copy in Drive is one this phone has not merged yet. Both sides
+/// are Drive's own timestamps, so phone clocks never enter into it.
+bool cloudRemoteNewer(DateTime remote, String? seenIso) {
+  final seen = seenIso == null ? null : DateTime.tryParse(seenIso);
+  return seen == null || remote.isAfter(seen);
+}
+
+class CloudOutcome {
+  final bool ok;
+  final String message;
+  final bool retryable;
+  const CloudOutcome(this.ok, this.message, {this.retryable = false});
+}
+
+class CloudSync extends ChangeNotifier {
+  CloudSync._();
+  static final CloudSync instance = CloudSync._();
+
+  final FlutterSecureStorage _secure = const FlutterSecureStorage();
+  bool _inited = false;
+  bool _busy = false;
+  Timer? _retry;
+  bool get busy => _busy;
+  String? lastError;
+
+  bool get on => Prefs.getBool(kCloudOnKey, false);
+  CloudRole? get role => CloudRole.fromName(Prefs.getString(kCloudRoleKey, ''));
+  String? get email {
+    final e = Prefs.getString(kCloudEmailKey, '');
+    return e.isEmpty ? null : e;
+  }
+
+  /// Off by default: uploads go over mobile data too. The person asked for
+  /// that; the Data screen describes changes and encrypted daily checkpoints.
+  bool get wifiOnly => Prefs.getBool(kCloudWifiOnlyKey, false);
+  DateTime? get lastUp => _at(kCloudLastUpKey);
+
+  /// New data since the last upload (a band sync landed). Persisted, so an
+  /// upload that failed or was cut off by the app closing is retried.
+  bool get dirty => Prefs.getBool(kCloudDirtyKey, false);
+  void markDirty() {
+    _dirtyGen++;
+    Prefs.setBool(kCloudDirtyKey, true);
+  }
+
+  // Bumped by every [markDirty]: an upload clears the flag only if no new data
+  // arrived while it was exporting, or that data would be marked as sent.
+  int _dirtyGen = 0;
+  DateTime? get lastCheck => _at(kCloudLastCheckKey);
+  DateTime? get remoteSeen {
+    final s = Prefs.getString(kCloudRemoteSeenKey, '');
+    return s.isEmpty ? null : DateTime.tryParse(s)?.toLocal();
+  }
+
+  DateTime? _at(String k) {
+    final v = Prefs.getInt(k, 0);
+    return v == 0 ? null : DateTime.fromMillisecondsSinceEpoch(v);
+  }
+
+  void setRole(CloudRole r) {
+    Prefs.setString(kCloudRoleKey, r.name);
+    notifyListeners();
+  }
+
+  void setWifiOnly(bool v) {
+    Prefs.setBool(kCloudWifiOnlyKey, v);
+    notifyListeners();
+  }
+
+  Future<bool> hasPassphrase() async =>
+      (await _secure.read(key: _kPassKey))?.isNotEmpty ?? false;
+
+  Future<void> setPassphrase(String p) => _secure.write(key: _kPassKey, value: p);
+
+  Future<void> _init() async {
+    if (_inited) return;
+    await GoogleSignIn.instance.initialize(
+      clientId: Platform.isIOS && kGoogleIosClientId.isNotEmpty ? kGoogleIosClientId : null,
+      serverClientId: kGoogleWebClientId,
+    );
+    _inited = true;
+  }
+
+  /// Interactive: the Google account picker, then the Drive consent.
+  Future<String> signIn() async {
+    await _init();
+    final acct = await GoogleSignIn.instance.authenticate(scopeHint: const [kDriveScope]);
+    await acct.authorizationClient.authorizeScopes(const [kDriveScope]);
+    Prefs.setString(kCloudEmailKey, acct.email);
+    Prefs.setBool(kCloudOnKey, true);
+    notifyListeners();
+    return acct.email;
+  }
+
+  /// Turn it off on THIS phone. The copy in Drive is left alone — it is the
+  /// person's file in the person's Drive, and deleting it is theirs to do.
+  Future<void> signOut() async {
+    try {
+      await _init();
+      await GoogleSignIn.instance.signOut();
+    } catch (_) {}
+    Prefs.setBool(kCloudOnKey, false);
+    Prefs.setString(kCloudEmailKey, '');
+    Prefs.setString(kCloudRemoteSeenKey, '');
+    Prefs.setString(kCloudRemoteRevisionKey, '');
+    Prefs.setString(kCloudRoleKey, '');
+    Prefs.setString(kCloudUpMarkKey, '');
+    Prefs.setInt(kCloudLastUpKey, 0);
+    Prefs.setInt(kCloudLastCheckKey, 0);
+    await _secure.delete(key: _kPassKey);
+    notifyListeners();
+  }
+
+  /// A token without UI, or null when Google wants the person back in the
+  /// loop — the foreground pass then stays quiet and the screen says so.
+  Future<String?> _token({required bool interactive}) async {
+    await _init();
+    final acct = await GoogleSignIn.instance.attemptLightweightAuthentication();
+    if (acct == null) {
+      if (!interactive) return null;
+      final a = await GoogleSignIn.instance.authenticate(scopeHint: const [kDriveScope]);
+      return (await a.authorizationClient.authorizeScopes(const [kDriveScope])).accessToken;
+    }
+    final z = await acct.authorizationClient.authorizationForScopes(const [kDriveScope]);
+    if (z != null) return z.accessToken;
+    if (!interactive) return null;
+    return (await acct.authorizationClient.authorizeScopes(const [kDriveScope])).accessToken;
+  }
+
+  /// Foreground hook: does nothing unless switched on and due. [importWhoop]
+  /// lets a SENDING phone pick up a WHOOP export the web dashboard sent; it
+  /// looks for one every [kCloudCheckEvery] (a metadata request) even when
+  /// there is nothing of its own to upload.
+  Future<void> runIfDue(
+    Future<int> Function(String path) importBackup, {
+    Future<int> Function(List<String> paths)? importWhoop,
+    bool retryTransient = true,
+  }) async {
+    // The Android background sync writes these keys from its own isolate, so
+    // re-read them: a stale cache re-uploaded what it had just sent.
+    await Prefs.reload();
+    notifyListeners();
+    final r = role;
+    if (!on || !cloudConfigured || r == null) return;
+    final now = DateTime.now();
+    final dirty = r == CloudRole.send && await _hasNewData();
+    // New data that has to wait — for the 2-minute spacing, or for an upload
+    // already running — gets ONE retry at the moment it may go. Without it the
+    // drain that lands a minute after the on-open upload never reached Drive
+    // until the next sync, and the dashboard stayed a step behind.
+    final wait = cloudRetryIn(r, now, lastUp: lastUp, dirty: dirty, busy: _busy);
+    if (wait != null) {
+      _retry?.cancel();
+      _retry = Timer(wait, () {
+        _retry = null;
+        unawaited(runIfDue(importBackup, importWhoop: importWhoop));
+      });
+    }
+    if (_busy) return;
+    final due = cloudDue(r, now,
+        lastUp: lastUp, lastCheck: lastCheck, dirty: dirty);
+    final check = r == CloudRole.send &&
+        importWhoop != null &&
+        cloudDue(CloudRole.receive, now, lastCheck: lastCheck);
+    if (!due && !check) return;
+    try {
+      final outcome = await run(importBackup,
+          importWhoop: importWhoop, interactive: false, upload: due);
+      if (retryTransient && outcome.retryable) {
+        _retry ??= Timer(kCloudCheckEvery + const Duration(seconds: 1), () {
+          _retry = null;
+          unawaited(runIfDue(importBackup,
+              importWhoop: importWhoop, retryTransient: false));
+        });
+      }
+    } catch (_) {
+      // `run` records the error for the screen; a resume hook must not throw.
+    }
+  }
+
+  /// The Android background sync's hook: after the band has drained and the
+  /// day derived with the app closed, a SENDING phone uploads when due. Never
+  /// interactive (a lapsed sign-in just waits for the next foreground), and
+  /// still Wi-Fi-gated when that is on. Receiving stays foreground-only: it
+  /// merges through the app's import path, which a headless wake does not run.
+  Future<void> runSendInBackground() async {
+    await Prefs.ensureLoaded();
+    await Prefs.reload();
+    if (!on || !cloudConfigured || role != CloudRole.send || _busy) return;
+    // A wake that drained nothing has nothing new to send.
+    if (!cloudDue(CloudRole.send, DateTime.now(),
+        lastUp: lastUp, dirty: await _hasNewData())) {
+      return;
+    }
+    try {
+      await run((_) async => 0, interactive: false);
+    } catch (_) {
+      // `run` records the error for the screen; a background wake must not throw.
+    }
+  }
+
+  /// One pass in this phone's direction. [interactive] lets Google show its
+  /// sign-in again when the token has lapsed — only from a button press.
+  /// A sending phone first imports any WHOOP export the dashboard sent
+  /// ([importWhoop]); with [upload] false it uploads only if that brought
+  /// something in.
+  Future<CloudOutcome> run(
+    Future<int> Function(String path) importBackup, {
+    Future<int> Function(List<String> paths)? importWhoop,
+    bool interactive = true,
+    bool upload = true,
+  }) async {
+    if (_busy) return const CloudOutcome(false, 'Already syncing.');
+    _busy = true;
+    lastError = null;
+    notifyListeners();
+    DriveApi? drive;
+    try {
+      final pass = await _secure.read(key: _kPassKey);
+      if (pass == null || pass.isEmpty) {
+        return _fail('Set the cloud passphrase first.');
+      }
+      // Bounded like every Drive call (see kDriveCallTimeout): an
+      // interactive sign-in gets time for the person to pick an account.
+      final token = await _token(interactive: interactive).timeout(
+          interactive ? const Duration(minutes: 3) : kDriveCallTimeout);
+      if (token == null) return _fail('Sign in to Google again to keep syncing.');
+      final r = role;
+      if (r == null) {
+        return _fail('Choose whether this phone sends or receives first.');
+      }
+      final api = drive = DriveApi(token);
+      if (r == CloudRole.receive) return await _receive(api, pass, importBackup);
+      final picked =
+          importWhoop == null ? 0 : await _pickUpWhoop(api, pass, importWhoop);
+      if (!upload && picked == 0) return const CloudOutcome(true, 'Up to date.');
+      final sent = await _send(api, pass, interactive: interactive);
+      return picked == 0 || !sent.ok
+          ? sent
+          : CloudOutcome(true,
+              'Imported $picked WHOOP export${picked == 1 ? '' : 's'} from your Koop Cloud and uploaded.');
+    } on DriveException catch (e) {
+      return _fail(e.unauthorized
+          ? 'Google sign-in expired. Tap Sync now to sign in again.'
+          : 'Google Drive refused the request (${e.status}).',
+          retryable: e.status == 429 || (e.status >= 500 && e.status < 600));
+    } on TimeoutException {
+      return _fail('Google Drive did not answer.', retryable: true);
+    } on SocketException {
+      return _fail('The connection to Google Drive was interrupted.',
+          retryable: true);
+    } on ClientException {
+      return _fail('The connection to Google Drive was interrupted.',
+          retryable: true);
+    } catch (e) {
+      return _fail('$e');
+    } finally {
+      drive?.close();
+      // Cleared on every path, including the throws above: a latch left set
+      // here would stop cloud sync until the app is killed (AGENTS §4.3).
+      _busy = false;
+      notifyListeners();
+    }
+  }
+
+  /// Import every WHOOP export the web dashboard left in Drive > Koop
+  /// ([kDriveWhoopFileName]), through the app's own WHOOP importer, then move
+  /// it to the Drive bin. Returns how many were imported. One that will not
+  /// open (sent under another passphrase) stays put and says so; one that
+  /// opens but is not a WHOOP export is binned with the reason, rather than
+  /// failing again every pass.
+  Future<int> _pickUpWhoop(
+    DriveApi api,
+    String pass,
+    Future<int> Function(List<String> paths) importWhoop,
+  ) async {
+    Prefs.setInt(kCloudLastCheckKey, DateTime.now().millisecondsSinceEpoch);
+    final folder = await api.find(kDriveFolderName, folder: true);
+    if (folder == null) return 0;
+    final files = await api.findAll(kDriveWhoopFileName, parent: folder.id);
+    var n = 0;
+    for (final f in files) {
+      final tmp = await getTemporaryDirectory();
+      final stamp = '${DateTime.now().millisecondsSinceEpoch}-$n';
+      final enc = File('${tmp.path}/whoop-$stamp.kbak');
+      final zip = File('${tmp.path}/whoop-$stamp.zip');
+      try {
+        await api.download(f.id, enc);
+        try {
+          await Isolate.run(() => decryptBackupFile(enc, zip, pass));
+        } catch (_) {
+          lastError = 'A WHOOP export in your Koop Cloud would not open: it '
+              'was sent with a different passphrase than this phone has.';
+          continue;
+        }
+        try {
+          await importWhoop([zip.path]);
+          n++;
+        } catch (e) {
+          lastError = 'A WHOOP export from your Koop Cloud could not be '
+              'imported: $e';
+        }
+        await api.trash(f.id);
+      } finally {
+        // The decrypted export is health data in plaintext.
+        for (final x in [enc, zip]) {
+          try {
+            if (await x.exists()) await x.delete();
+          } catch (_) {}
+        }
+      }
+    }
+    return n;
+  }
+
+  /// The manual flag (a passphrase change) or a data mark that moved since
+  /// the last upload.
+  Future<bool> _hasNewData() async =>
+      dirty ||
+      await LocalDb.cloudDataMark() != Prefs.getString(kCloudUpMarkKey, '');
+
+  /// One upload at a time across the WHOLE process: the Android background
+  /// sync and the foreground app are separate isolates, so `_busy` alone let
+  /// both create a "Koop" folder at once. The name is registered atomically;
+  /// a holder that died without releasing it (its isolate was killed) no
+  /// longer answers the ping, and the lock is taken over.
+  static Future<ReceivePort?> _takeSendLock() async {
+    final port = ReceivePort();
+    for (var attempt = 0; attempt < 2; attempt++) {
+      if (IsolateNameServer.registerPortWithName(port.sendPort, _kSendLockName)) {
+        port.listen((m) {
+          if (m is SendPort) m.send(true);
+        });
+        return port;
+      }
+      final holder = IsolateNameServer.lookupPortByName(_kSendLockName);
+      if (holder != null) {
+        final reply = ReceivePort();
+        holder.send(reply.sendPort);
+        final alive = await reply.first
+            .timeout(const Duration(seconds: 2), onTimeout: () => false);
+        reply.close();
+        if (alive == true) break;
+      }
+      IsolateNameServer.removePortNameMapping(_kSendLockName);
+    }
+    port.close();
+    return null;
+  }
+
+  CloudOutcome _fail(String m, {bool retryable = false}) {
+    lastError = m;
+    return CloudOutcome(false, m, retryable: retryable);
+  }
+
+  Future<CloudOutcome> _send(DriveApi api, String pass, {required bool interactive}) async {
+    if (wifiOnly && !interactive) {
+      final net = await Connectivity().checkConnectivity();
+      if (!net.contains(ConnectivityResult.wifi) &&
+          !net.contains(ConnectivityResult.ethernet)) {
+        return const CloudOutcome(false, 'Waiting for Wi-Fi.');
+      }
+    }
+    final lock = await _takeSendLock();
+    if (lock == null) return const CloudOutcome(false, 'Already uploading.');
+    try {
+      return await _sendLocked(api, pass);
+    } finally {
+      IsolateNameServer.removePortNameMapping(_kSendLockName);
+      lock.close();
+    }
+  }
+
+  Future<CloudTransfer> _transfer(DriveApi api, String pass) async {
+    final tmp = await getTemporaryDirectory();
+    final account = sha256.convert(
+      utf8.encode(Prefs.getString(kCloudEmailKey, '')),
+    );
+    return CloudTransfer(
+      api: api,
+      cache: Directory('${tmp.path}/koop-cloud-cache-$account'),
+      passphrase: pass,
+      snapshot: LocalDb.exportCopy,
+    );
+  }
+
+  Future<CloudOutcome> _sendLocked(DriveApi api, String pass) async {
+    final gen = _dirtyGen;
+    // A mark taken before the snapshot leaves later arrivals dirty for retry.
+    final mark = await LocalDb.cloudDataMark();
+    final folder = await api.folder();
+    final sent = await (await _transfer(api, pass)).send(folder);
+    unawaited(
+      FileLog.write(
+        '[cloud] backup mode=${sent.mode} bytes=${sent.bytes} '
+        'snapshot_ms=${sent.snapshotMs} prepare_ms=${sent.prepareMs} '
+        'upload_ms=${sent.uploadMs}',
+      ),
+    );
+    try {
+      await _uploadLog(api, folder, pass);
+    } catch (e) {
+      debugPrint('[cloud] log upload skipped: $e');
+    }
+    Prefs.setInt(kCloudLastUpKey, DateTime.now().millisecondsSinceEpoch);
+    if (gen == _dirtyGen) Prefs.setBool(kCloudDirtyKey, false);
+    Prefs.setString(kCloudUpMarkKey, mark);
+    rememberCloudCopy(sent);
+    return CloudOutcome(
+      true,
+      sent.mode == 'delta'
+          ? 'Uploaded changes to your Google Drive.'
+          : 'Uploaded a full encrypted checkpoint to your Google Drive.',
+    );
+  }
+
+  /// Bytes of the log's newest end that go to Drive with each upload.
+  static const int kCloudLogBytes = 512 * 1024;
+
+  /// The newest [kCloudLogBytes] of the app log (the rotated `.1` file first
+  /// when the live one is short), gzipped and locked with [pass] exactly like
+  /// the data, as [kDriveLogName]. The log can hold health numbers, so it gets
+  /// the same protection as the database and goes only to the person's Drive.
+  Future<void> _uploadLog(DriveApi api, String folder, String pass) async {
+    final path = await FileLog.path();
+    if (path == null) return;
+    final tmp = await getTemporaryDirectory();
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final plain = File('${tmp.path}/koop-log-$stamp.gz');
+    final enc = File('${tmp.path}/koop-log-$stamp.kbak');
+    try {
+      final parts = <List<int>>[];
+      for (final f in [File('$path.1'), File(path)]) {
+        if (await f.exists()) parts.add(await f.readAsBytes());
+      }
+      final all = parts.expand((b) => b).toList();
+      if (all.isEmpty) return;
+      final tail = all.length > kCloudLogBytes
+          ? all.sublist(all.length - kCloudLogBytes)
+          : all;
+      await plain.writeAsBytes(gzip.encode(tail));
+      await Isolate.run(() => encryptBackupFile(plain, enc, pass));
+      final existing = await api.find(kDriveLogName, parent: folder);
+      await api.upload(enc, folder, existingId: existing?.id, name: kDriveLogName);
+    } finally {
+      for (final f in [plain, enc]) {
+        try {
+          if (await f.exists()) await f.delete();
+        } catch (_) {}
+      }
+    }
+  }
+
+  Future<CloudOutcome> _receive(
+    DriveApi api,
+    String pass,
+    Future<int> Function(String path) importBackup,
+  ) async {
+    Prefs.setInt(kCloudLastCheckKey, DateTime.now().millisecondsSinceEpoch);
+    final folder = await api.find(kDriveFolderName, folder: true);
+    if (folder == null) {
+      return _fail(
+        'No Koop copy in this Google Drive yet. Sync the phone with the band first.',
+      );
+    }
+    try {
+      final received = await (await _transfer(api, pass)).receive(
+        folder.id,
+        Prefs.getString(kCloudRemoteRevisionKey, ''),
+        importBackup,
+      );
+      if (received == null) return const CloudOutcome(true, 'Up to date.');
+      // Advance only after a complete, authenticated reconstruction imports.
+      rememberCloudCopy(received);
+      return CloudOutcome(
+        true,
+        'Updated from your Google Drive (${received.days} days).',
+      );
+    } on BackupFormatException {
+      return _fail(
+        'Could not open the cloud copy. Is the passphrase the same as on the other phone?',
+      );
+    }
+  }
+}

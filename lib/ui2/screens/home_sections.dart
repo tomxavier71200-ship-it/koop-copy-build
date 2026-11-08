@@ -1,0 +1,1948 @@
+// HOME SECTIONS — the dashboard, "Your day", the weekly insight and the
+// journal check-in. Each reads only what HomeData already loaded, and each
+// says what it does not know rather than filling the gap:
+//
+//   · A dashboard row's "30-day average" is the average of the days that
+//     actually exist in the last 30, and names how many. Under
+//     [kBaselineMin] days there is no average and no arrow — two days is not a
+//     baseline — only the value and how far the baseline has to go.
+//   · "Your day" lists only the day the bundle is FOR; a partial today that
+//     fell back to yesterday's bundle shows nothing rather than yesterday's
+//     run as today's.
+//   · The weekly insight is arithmetic on the same series (this week's mean
+//     against the 30-day mean) and is hidden when there is not enough of
+//     either to compare.
+
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
+import 'package:provider/provider.dart';
+
+import '../../data/day_label.dart';
+import '../../data/journal_fields.dart' show JournalMetricValue, formatMinuteOfDay, journalWindowDays;
+import '../../gestures/device_action.dart';
+import '../../notify/notification_center.dart';
+import '../../notify/notification_prefs.dart';
+import '../../state/app_state.dart';
+import '../../state/prefs.dart';
+import '../../theme/theme_switcher.dart' show themedRoute;
+import '../activity/day_strain.dart' show DayStrainDetail;
+import '../../compute/workout_autolog.dart' show kUnnamedWorkoutType;
+import '../activity/catalogue.dart' show activityByName;
+import '../ui2.dart';
+import 'home_screen.dart';
+import 'health_screen.dart' show kStressLevelColors, kStressLevelWords, stressLevelOf;
+import 'coach.dart' show kCoachAccent;
+import 'journal_compose.dart';
+import 'workout_screen.dart' show openActivityPicker;
+import 'log_workout.dart'
+    show LogWorkout, Suggestion, WorkoutSuggestionScreen, activeSuggestions;
+import 'metric_detail.dart' show MetricDetail, MetricSpec, specOf;
+import 'stress_monitor.dart' show StressDay, StressMonitorScreen;
+import 'strength_screen.dart' show StrengthScreen;
+import 'overview_screen.dart' show OverviewScreen;
+import 'vo2max_screen.dart' show Vo2maxScreen, vo2Points;
+import '../profile/profile.dart' show ProfileHome, goto;
+import '../../data/local_repository.dart' show LocalRepository;
+import '../../data/db.dart' show LocalDb;
+import 'sleep_detail.dart';
+import 'health_monitor.dart' show StressSparkline;
+import 'stress_detail.dart'
+    show StressLine, StressReading, kStressMinMinutes, stressEnough, stressMinutes, stressReadings;
+
+/// Days a dashboard average needs before it exists.
+const kBaselineMin = 4;
+
+/// Every metric the dashboard can show, in its default order. Skin temperature
+/// is not offered: it is a deviation, not a value, and is suppressed as a
+/// trend everywhere else too.
+const kDashMetrics = [
+  'hrv',
+  'resting_hr',
+  'resp_rate',
+  'steps',
+  'sleep',
+  'readiness',
+  'strain',
+  'calories',
+  'stress',
+  'efficiency',
+  'deep',
+  'rem',
+  'active_min',
+  // WHOOP's other rows (see dashExtraSeries).
+  'avg_hr',
+  'sleep_need',
+  'zones_13',
+  'zones_45',
+  'strength_min',
+  'stress_graph',
+  // The rest of WHOOP's Customize list.
+  'vo2max',
+  'sleep_perf',
+  'restorative_pct',
+  'sleep_debt',
+  'consistency',
+  'zones_all',
+  'restorative_h',
+  'time_in_bed',
+  'weight',
+  'lean_mass',
+  'cigarettes',
+];
+
+/// On by default: WHOOP's dashboard set, as far as this app stores it.
+const _dashDefaultOn = {
+  'hrv', 'resting_hr', 'steps', 'calories', 'resp_rate', 'sleep', //
+  'efficiency', 'readiness', 'avg_hr', 'sleep_need', 'zones_13', //
+  'zones_45', 'strength_min', 'vo2max', 'sleep_perf', 'restorative_pct', //
+  'sleep_debt', 'consistency',
+  'cigarettes',
+  // Off by default, as WHOOP lists them under "Add to my dashboard":
+  // zones_all, restorative_h, time_in_bed, weight, lean_mass.
+  // 'stress_graph' stays off by default: Home's Stress Monitor tile already
+  // shows the same level, and one number twice on one screen is a defect.
+};
+
+/// Rows the app keeps no history for: today's value only, and what the
+/// under-line says in place of a 30-day average.
+const _single = {
+  'sleep_need': 'tonight',
+  'sleep_debt': 'today',
+  'consistency': 'last 4 weeks',
+  'weight': 'from your profile',
+};
+
+/// Metrics with no better direction: the arrow states the direction, never a
+/// verdict.
+const _neutral = {'resp_rate', 'calories', 'weight', 'lean_mass', 'time_in_bed'};
+
+const _kDashKey = 'ui.dash_metrics';
+
+/// The user's dashboard metrics, in order, with visibility. Same storage rule
+/// as `homeSections`: '-' prefix hides, unknown ids drop, new ids append with
+/// their default visibility.
+List<({String id, bool on})> dashMetrics() {
+  final raw = Prefs.getString(_kDashKey, '');
+  final out = <({String id, bool on})>[];
+  if (raw.isNotEmpty) {
+    for (final t in raw.split(',')) {
+      final off = t.startsWith('-');
+      final id = off ? t.substring(1) : t;
+      if (kDashMetrics.contains(id) && !out.any((s) => s.id == id)) {
+        out.add((id: id, on: !off));
+      }
+    }
+  }
+  for (final id in kDashMetrics) {
+    if (!out.any((s) => s.id == id)) {
+      out.add((id: id, on: _dashDefaultOn.contains(id)));
+    }
+  }
+  return out;
+}
+
+void setDashMetrics(List<({String id, bool on})> v) {
+  Prefs.setString(_kDashKey, v.map((s) => '${s.on ? '' : '-'}${s.id}').join(','));
+  homeLayoutRev.value++;
+}
+
+String dashName(String k) => k == 'cigarettes' ? 'Cigarettes' : _dashSpec(k).title;
+
+String _fmt(String k, double v) => switch (k) {
+      'sleep' || 'deep' || 'rem' || 'sleep_need' || 'sleep_debt' || //
+      'restorative_h' || 'time_in_bed' => hm(v),
+      'weight' || 'lean_mass' => v.toStringAsFixed(1),
+      'zones_13' || 'zones_45' || 'zones_all' || 'strength_min' =>
+        '${v.round() ~/ 60}:${(v.round() % 60).toString().padLeft(2, '0')}',
+      'strain' || 'resp_rate' => v.toStringAsFixed(1),
+      'steps' || 'calories' => thousands(v),
+      _ => '${v.round()}',
+    };
+
+String _unit(String k) => switch (k) {
+      'sleep' || 'deep' || 'rem' || 'sleep_need' || 'sleep_debt' || //
+      'restorative_h' || 'time_in_bed' => '',
+      'zones_13' || 'zones_45' || 'zones_all' || 'strength_min' || 'vo2max' => '',
+      'readiness' || 'sleep_perf' || 'restorative_pct' || 'consistency' => '%',
+      'weight' || 'lean_mass' => 'kg',
+      'stress' => '/100',
+      _ => specOf(k).unit,
+    };
+
+/// This metric's newest point, and the 30-day comparison behind it.
+({
+  ChartPoint last,
+  double? avg,
+  int n,
+  List<double> week,
+})? _summary(List<ChartPoint> pts) {
+  if (pts.isEmpty) return null;
+  final last = pts.last;
+  // The 30 calendar days before the reading itself — calendar arithmetic, so
+  // a DST change inside the window does not shift it by an hour.
+  final at = DateTime.fromMillisecondsSinceEpoch(last.t * 1000);
+  final from =
+      DateTime(at.year, at.month, at.day - 30).millisecondsSinceEpoch ~/ 1000;
+  final prior = [
+    for (final p in pts)
+      if (p.t >= from && p.t < last.t) p.v,
+  ];
+  final n = prior.length;
+  return (
+    last: last,
+    avg: n >= kBaselineMin ? prior.reduce((a, b) => a + b) / n : null,
+    n: n,
+    week: [for (final p in pts.skip(pts.length > 7 ? pts.length - 7 : 0)) p.v],
+  );
+}
+
+// ─────────────── dashboard ───────────────
+
+/// The points up to the end of the day Home is showing, so stepping back to
+/// Friday shows Friday's numbers and Friday's own 30 days — never a later day.
+List<ChartPoint> _upTo(HomeData d, List<ChartPoint> pts) {
+  final end = d.dayId == null ? null : localDayEndSec(d.dayId!);
+  return end == null ? pts : [for (final x in pts) if (x.t < end) x];
+}
+
+Widget dashboardCard(BuildContext c, HomeData d, VoidCallback onEdit) {
+  final p = P.of(c);
+  final shown = dashMetrics().where((m) => m.on).toList();
+  // One card per metric, WHOOP's dashboard: a stack, not rows in one box.
+  if (shown.isEmpty) {
+    return Surface(
+      onTap: onEdit,
+      child: Text('No metrics picked. Tap Edit to add some.',
+          style: F.body.copyWith(color: p.ink3)),
+    );
+  }
+  return Column(children: [
+    for (var i = 0; i < shown.length; i++) ...[
+      if (i > 0) const SizedBox(height: S.x2),
+      if (shown[i].id == 'cigarettes')
+        _CigaretteDashboard(date: d.pastDay ?? todayLabel())
+      else if (shown[i].id == 'stress_graph')
+        const StressDashRow()
+      else
+        _dashRow(
+            c,
+            p,
+            shown[i].id,
+            _upTo(
+                d,
+                shown[i].id == 'sleep_need'
+                    ? sleepNeedSeries(d)
+                    : d.series[shown[i].id] ?? const []),
+            d.dayId ?? todayLabel()),
+    ],
+  ]);
+}
+
+/// A self-reported count, kept separate from sensor measurements and scores.
+class CigaretteLogCard extends StatefulWidget {
+  final int? count, lastMinute;
+  final String? status;
+  final VoidCallback? onEdit, onRemove;
+  final String? day;
+  final Map<String, JournalMetricValue> history;
+  const CigaretteLogCard({super.key, this.count, this.lastMinute,
+      this.status, this.onEdit, this.onRemove, this.day, this.history = const {}});
+  @override
+  State<CigaretteLogCard> createState() => _CigaretteLogCardState();
+}
+
+class _CigaretteLogCardState extends State<CigaretteLogCard> {
+  int _days = 7;
+  @override
+  Widget build(BuildContext c) {
+    final count = widget.count, lastMinute = widget.lastMinute;
+    final status = widget.status;
+    final onEdit = widget.onEdit;
+    final dates = journalWindowDays(widget.day ?? todayLabel(), _days);
+    final series = [for (final date in dates) () {
+      final value = widget.history[date]?.value;
+      return value != null && value.isFinite && value >= 0 && value <= 100
+          ? value.roundToDouble() : null;
+    }()];
+    final known = series.whereType<double>().toList();
+    final largest = known.fold<double>(0, math.max);
+    final axis = AxisSpec(min: 0, max: math.max(2, (largest / 2).ceil() * 2).toDouble(),
+        format: (v) => v.round().toString());
+    final p = P.of(c);
+    final detail = status ?? (count == null ? 'Not logged for this day'
+        : lastMinute == null || count == 0 ? 'Self-reported'
+        : 'Last logged ${formatMinuteOfDay(lastMinute)} · self-reported');
+    return Surface(
+      semanticLabel: 'Cigarettes: ${count ?? 'not logged'}. $detail. Edit in journal',
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(LucideIcons.cigarette, size: 20, color: p.ink3),
+          const SizedBox(width: S.x3),
+          Expanded(child: Text('CIGARETTES', style: F.over.copyWith(
+              color: p.ink, letterSpacing: 1.6, fontWeight: FontWeight.w700))),
+          const SizedBox(width: S.x2),
+          Text(count?.toString() ?? '—', style: F.n34.copyWith(color: p.ink)),
+        ]),
+        const SizedBox(height: S.x2),
+        Text(detail, style: F.cap.copyWith(color: p.ink3)),
+        const SizedBox(height: S.x3),
+        SubTabs(const ['7 days', '30 days'], _days == 7 ? 0 : 1,
+            (i) => setState(() => _days = i == 0 ? 7 : 30), color: C.blue),
+        const SizedBox(height: S.x2),
+        ChartFrame(title: 'Daily cigarettes', unit: 'cigarettes',
+          series: series, yAxis: axis,
+          xLabels: [dates.first.substring(5), dates.last.substring(5)],
+          empty: known.isEmpty ? NoData(message: status ?? 'No recorded days yet') : null,
+          footnote: '${known.fold<double>(0, (sum, v) => sum + v).round()} recorded · '
+              '${known.length}/$_days days logged. Unlogged days are gaps.',
+          child: CustomPaint(size: Size.infinite,
+            painter: Bars(series, p.on(C.blue), highlight: series.length - 1, axis: axis))),
+        const SizedBox(height: S.x2),
+        Wrap(spacing: S.x4, runSpacing: S.x1, children: [
+          if (onEdit != null) Pressable(onTap: onEdit,
+            semanticLabel: 'Edit cigarette count in journal',
+            child: Text('Edit in journal', style: F.cap.copyWith(color: p.on(C.blue)))),
+          if (widget.onRemove != null && (count ?? 0) > 0)
+            Pressable(onTap: widget.onRemove,
+              semanticLabel: 'Remove one cigarette from this day',
+              child: Text('Remove one', style: F.cap.copyWith(color: p.on(C.red)))),
+        ]),
+      ]),
+    );
+  }
+}
+
+class _CigaretteDashboard extends StatefulWidget {
+  final String date;
+  const _CigaretteDashboard({required this.date});
+  @override
+  State<_CigaretteDashboard> createState() => _CigaretteDashboardState();
+}
+
+class _CigaretteDashboardState extends State<_CigaretteDashboard>
+    with RevisionReload {
+  JournalMetricValue? _value;
+  Map<String, JournalMetricValue> _history = const {};
+  String? _status = 'Loading entries…';
+  bool _removing = false;
+
+  @override
+  void initState() { super.initState(); _load(); }
+  @override
+  void reload() => _load();
+
+  Future<void> _remove() async {
+    if (_removing) return;
+    final repo = repoOf(context);
+    if (repo == null) return;
+    final day = widget.date;
+    setState(() => _removing = true);
+    try {
+      final previous = await repo.adjustCigaretteCount(day, -1);
+      if (!mounted) return;
+      await _load();
+      if (!mounted || previous == null) return;
+      context.read<AppState>().bumpInsights();
+      var undone = false;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('One cigarette removed from $day'),
+        action: SnackBarAction(label: 'Undo', onPressed: () async {
+          if (undone) return;
+          undone = true;
+          try {
+            final restored = await repo.adjustCigaretteCount(day, 1,
+                restoreMinute: previous.atMinuteOfDay);
+            if (mounted) {
+              context.read<AppState>().bumpInsights();
+              await _load();
+              if (restored == null && mounted) setState(() => _status = 'Couldn’t undo. Edit the journal to correct the count.');
+            }
+          } catch (_) {
+            if (mounted) setState(() => _status = 'Couldn’t undo. Edit the journal to correct the count.');
+          }
+        }),
+      ));
+    } catch (_) {
+      if (mounted) setState(() => _status = 'Couldn’t remove the entry. Try again.');
+    } finally {
+      if (mounted) setState(() => _removing = false);
+    }
+  }
+  @override
+  void didUpdateWidget(covariant _CigaretteDashboard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.date != widget.date) {
+      _value = null;
+      _history = const {};
+      _status = 'Loading entries…';
+      _load();
+    }
+  }
+  Future<void> _load() async {
+    final token = beginRead(#cigarettes);
+    final repo = repoOf(context);
+    if (repo == null) return;
+    try {
+      final day = widget.date;
+      final values = await repo.getJournalMetricHistory('cigarettes',
+          from: journalWindowDays(day, 30).first, through: day);
+      if (stillNewest(#cigarettes, token)) {
+        setState(() { _history = values; _value = values[day]; _status = null; });
+      }
+    } catch (_) {
+      if (stillNewest(#cigarettes, token)) {
+        setState(() { _history = const {}; _value = null; _status = 'Couldn’t load cigarette entries'; });
+      }
+    }
+  }
+  @override
+  Widget build(BuildContext c) {
+    final AppState app;
+    try { app = c.read<AppState>(); } catch (_) { return const SizedBox.shrink(); }
+    return ListenableBuilder(listenable: app.gestureSettings, builder: (c, _) {
+      if (_value == null && _history.isEmpty && app.gestureSettings.doubleTap != DeviceAction.logCigarette) {
+        return const SizedBox.shrink();
+      }
+      return Padding(padding: const EdgeInsets.only(bottom: S.x2),
+        child: CigaretteLogCard(day: widget.date, history: _history, count: _value?.value.round(),
+          lastMinute: _value?.atMinuteOfDay, status: _status,
+          onRemove: _removing ? null : _remove,
+          onEdit: () async {
+            await goto(c, JournalCompose(date: widget.date));
+            if (mounted) { app.bumpInsights(); _load(); }
+          }),
+      );
+    });
+  }
+}
+
+Widget _dashRow(
+    BuildContext c, P p, String k, List<ChartPoint> pts, String viewing) {
+  final spec = _dashSpec(k);
+  final s = _summary(pts);
+  final today = viewing;
+
+  // Under the number: the 30-day average as a bare number, WHOOP-style, or
+  // how far the baseline has to go. `said` is the full sentence for a screen
+  // reader. A reading from another day says which day under the name.
+  String under, said, dated = '';
+  IconData? arrow;
+  Color arrowColor = p.ink3;
+  if (s == null) {
+    // The band cannot weigh anything: lean mass comes only from a scale.
+    under = k == 'lean_mass' ? 'needs a scale' : '';
+    said = k == 'lean_mass'
+        ? 'Not measured; it needs a body-composition scale'
+        : 'No data yet';
+  } else {
+    final day = dayLabelOf(DateTime.fromMillisecondsSinceEpoch(s.last.t * 1000));
+    if (day != today) dated = _short(day);
+    final avg = s.avg;
+    if (avg == null && _single.containsKey(k)) {
+      under = _single[k]!;
+      said = _single[k]!;
+    } else if (avg == null) {
+      under = '${s.n}/$kBaselineMin days';
+      said = 'Baseline ${s.n} of $kBaselineMin days';
+    } else {
+      under = _fmt(k, avg);
+      said = 'Average ${_fmt(k, avg)} over ${s.n} days';
+      final rel = avg == 0 ? 0.0 : (s.last.v - avg) / avg.abs();
+      if (rel.abs() < .02) {
+        arrow = LucideIcons.dot;
+      } else {
+        final up = rel > 0;
+        arrow = up ? LucideIcons.chevronUp : LucideIcons.chevronDown;
+        if (!_neutral.contains(k)) {
+          arrowColor = p.on(up == spec.higherBetter ? C.green : C.orange);
+        }
+      }
+    }
+  }
+
+  return Surface(
+    // The extra rows open the screen that holds their detail.
+    onTap: () => go(
+        c,
+        switch (k) {
+          'zones_13' || 'zones_45' => const DayStrainDetail(),
+          'sleep_need' => const SleepDetail(),
+          'strength_min' => const StrengthScreen(),
+          'avg_hr' || 'zones_all' => const DayStrainDetail(),
+          'vo2max' => const Vo2maxScreen(),
+          'sleep_perf' || 'restorative_pct' || 'restorative_h' || //
+          'time_in_bed' || 'sleep_debt' || 'consistency' =>
+            const SleepDetail(),
+          'weight' || 'lean_mass' => const ProfileHome(),
+          _ => MetricDetail(k),
+        }),
+    semanticLabel:
+        '${spec.title}. ${s == null ? 'No data' : _fmt(k, s.last.v)}. $said${dated.isEmpty ? '' : ', from $dated'}',
+    child: Row(children: [
+      Icon(spec.icon, size: 20, color: p.ink3),
+      const SizedBox(width: S.x3),
+      Expanded(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          // 'Recovery', the dial's word, rather than the spec's 'Readiness'.
+          Text((k == 'readiness' ? 'Recovery' : spec.title).toUpperCase(),
+              maxLines: 2,
+              style: F.over.copyWith(
+                  color: p.ink, letterSpacing: 1.6, fontWeight: FontWeight.w700)),
+          if (dated.isNotEmpty)
+            Text(dated, style: F.cap.copyWith(color: p.ink3)),
+        ]),
+      ),
+      const SizedBox(width: S.x2),
+      Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.baseline,
+          textBaseline: TextBaseline.alphabetic,
+          children: [
+            Text(s == null ? '—' : _fmt(k, s.last.v),
+                style: F.n34.copyWith(color: s == null ? p.ink3 : p.ink)),
+            if (s != null && _unit(k).isNotEmpty) ...[
+              const SizedBox(width: 2),
+              Text(_unit(k), style: F.over.copyWith(color: p.ink3)),
+            ],
+          ],
+        ),
+        if (under.isNotEmpty)
+          // Baseline progress is a note, not a number — it stays small.
+          Text(under,
+              style: (s!.avg == null ? F.cap : F.n17).copyWith(color: p.ink3)),
+      ]),
+      SizedBox(
+        width: 22,
+        child: arrow == null
+            ? null
+            : Icon(arrow, size: 16, color: arrowColor),
+      ),
+    ]),
+  );
+}
+
+// ─────────────── strain & recovery week ───────────────
+
+/// The last seven days of day strain (left scale, 0–21) and recovery (right
+/// scale, 0–100%) on one chart, WHOOP's weekly view. A day with no value is a
+/// gap in its line, never a zero. Null when neither series has two days.
+Widget? strainRecoveryCard(BuildContext c, HomeData d) {
+  final s = _weekTo(d, d.series['strain'] ?? const []);
+  final r = _weekTo(d, d.series['readiness'] ?? const []);
+  int count(List<double?> v) => v.where((x) => x != null).length;
+  if (count(s.values) < 2 && count(r.values) < 2) return null;
+  final p = P.of(c);
+  return Surface(
+    // WHOOP web's Overview: the same two lines over a chosen range.
+    onTap: () => go(c, OverviewScreen(series: d.series)),
+    semanticLabel: 'Strain and recovery, last 7 days. '
+        '${[for (var i = 0; i < 7; i++) '${s.labels[i]}: strain ${s.values[i]?.toStringAsFixed(1) ?? 'none'}, recovery ${r.values[i] == null ? 'none' : '${r.values[i]!.round()}%'}'].join('; ')}',
+    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Expanded(
+          child: Text('STRAIN & RECOVERY',
+              style: F.over.copyWith(color: p.ink, letterSpacing: 1.6)),
+        ),
+        Icon(LucideIcons.chevronRight, size: 18, color: p.ink3),
+      ]),
+      const SizedBox(height: S.x3),
+      SizedBox(
+        height: 190,
+        child: CustomPaint(
+          size: Size.infinite,
+          painter: _StrainRecovery(s.values, r.values, s.labels, p),
+        ),
+      ),
+    ]),
+  );
+}
+
+/// The seven days ENDING ON THE DAY HOME IS SHOWING, one slot per calendar
+/// day (null = no value), with weekday labels — "Today" only when that day is
+/// today. [denseDays] and [lastDays] both count back from now, which on a
+/// past day showed the wrong week (or, past seven days back, nothing).
+({List<double?> values, List<String> labels}) _weekTo(
+    HomeData d, List<ChartPoint> pts) {
+  final now = DateTime.now();
+  final viewed = d.dayId == null ? null : DateTime.tryParse(d.dayId!);
+  final back = viewed == null ? 0 : math.max(0, calendarDaysBetween(viewed, now));
+  final values = denseDays(pts, 7 + back).sublist(0, 7);
+  const wd = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  final end = DateTime(now.year, now.month, now.day - back);
+  final labels = [
+    for (var i = 6; i >= 0; i--)
+      i == 0 && back == 0
+          ? 'Today'
+          : wd[DateTime(end.year, end.month, end.day - i).weekday - 1],
+  ];
+  return (values: values, labels: labels);
+}
+
+class _StrainRecovery extends CustomPainter {
+  final List<double?> strain, rec;
+  final List<String> labels;
+  final P p;
+  _StrainRecovery(this.strain, this.rec, this.labels, this.p);
+
+  void _text(Canvas cv, String s, Offset at, TextStyle st,
+      {TextAlign align = TextAlign.center}) {
+    final tp = TextPainter(
+        text: TextSpan(text: s, style: st), textDirection: TextDirection.ltr)
+      ..layout();
+    final dx = switch (align) {
+      TextAlign.right => at.dx - tp.width,
+      TextAlign.left => at.dx,
+      _ => at.dx - tp.width / 2,
+    };
+    tp.paint(cv, Offset(dx, at.dy - tp.height / 2));
+  }
+
+  @override
+  void paint(Canvas cv, Size sz) {
+    const left = 26.0, right = 40.0, top = 14.0, bottom = 26.0;
+    final w = sz.width - left - right, h = sz.height - top - bottom;
+    double x(int i) => left + w * (i + .5) / 7;
+    double ys(double v) => top + h * (1 - v / 21);
+    double yr(double v) => top + h * (1 - v / 100);
+    final grid = Paint()
+      ..color = p.line
+      ..strokeWidth = 1;
+    final axis = F.cap.copyWith(fontWeight: FontWeight.w600);
+    for (final v in [0, 7, 14, 21]) {
+      cv.drawLine(Offset(left, ys(v.toDouble())), Offset(left + w, ys(v.toDouble())), grid);
+      _text(cv, '$v', Offset(left - 6, ys(v.toDouble())),
+          axis.copyWith(color: p.on(C.strain)), align: TextAlign.right);
+    }
+    for (final v in [0, 33, 66, 100]) {
+      _text(cv, '$v%', Offset(left + w + 6, yr(v.toDouble())),
+          axis.copyWith(color: p.on(readinessBand(v).color)),
+          align: TextAlign.left);
+    }
+    // Today's column, shaded.
+    cv.drawRRect(
+        RRect.fromRectAndRadius(
+            Rect.fromLTWH(x(6) - 14, top - 6, 28, h + 12), const Radius.circular(4)),
+        Paint()..color = p.card2);
+
+    void series(List<double?> v, double Function(double) y, Color line,
+        Color Function(double) dot, String Function(double) fmt, bool above) {
+      final stroke = Paint()
+        ..color = line
+        ..strokeWidth = 1.6
+        ..style = PaintingStyle.stroke;
+      for (var i = 1; i < 7; i++) {
+        final a = v[i - 1], b = v[i];
+        if (a != null && b != null) {
+          cv.drawLine(Offset(x(i - 1), y(a)), Offset(x(i), y(b)), stroke);
+        }
+      }
+      for (var i = 0; i < 7; i++) {
+        final val = v[i];
+        if (val == null) continue;
+        final o = Offset(x(i), y(val));
+        cv.drawCircle(o, 4.5, Paint()..color = p.card);
+        cv.drawCircle(
+            o,
+            4.5,
+            Paint()
+              ..color = dot(val)
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 2);
+        _text(cv, fmt(val), o + Offset(0, above ? -14 : 14),
+            F.cap.copyWith(color: dot(val), fontWeight: FontWeight.w700));
+      }
+    }
+
+    series(rec, yr, p.ink3, (v) => p.on(readinessBand(v).color),
+        (v) => '${v.round()}%', false);
+    series(strain, ys, p.on(C.strain), (_) => p.on(C.strain),
+        (v) => v.toStringAsFixed(1), true);
+    for (var i = 0; i < 7; i++) {
+      _text(cv, labels[i], Offset(x(i), sz.height - 8),
+          axis.copyWith(color: i == 6 ? p.ink : p.ink3));
+    }
+  }
+
+  @override
+  bool shouldRepaint(_StrainRecovery o) =>
+      o.strain != strain || o.rec != rec || o.p != p;
+}
+
+// ─────────────── your day ───────────────
+
+Widget yourDayCard(BuildContext c, HomeData d) {
+  final p = P.of(c);
+  final t = d.timeline;
+  final rows = <Widget>[];
+  // A past day the switcher is on lists that day's sleep and activities, as
+  // WHOOP's does; the add/start buttons are for today only.
+  final today = todayLabel();
+  final past = d.pastDay == today ? null : d.pastDay;
+  // Only the day this bundle is FOR — see the file header.
+  if (t['date'] == (past ?? today)) {
+    String hhmm(int s) {
+      final x = DateTime.fromMillisecondsSinceEpoch(s * 1000);
+      return clock(x.hour * 60 + x.minute);
+    }
+
+    for (final s in (t['sleep'] as List? ?? const [])) {
+      if (s is! Map || s['onset_ts'] is! num || s['wake_ts'] is! num) continue;
+      final on = (s['onset_ts'] as num).toInt(), off = (s['wake_ts'] as num).toInt();
+      // This spans bedtime to wake time, including estimated awake minutes.
+      // Name the measurement so it is not mistaken for Home's time asleep.
+      final mins = ((off - on) / 60).round();
+      rows.add(_dayRow(c, p, LucideIcons.moon, C.sleep, 'Sleep',
+          '${mins ~/ 60}:${(mins % 60).toString().padLeft(2, '0')}',
+          hhmm(on), hhmm(off), () => go(c, SleepDetail(day: past)),
+          measurementLabel: 'Time in bed'));
+    }
+    for (final w in (t['sessions'] as List? ?? const [])) {
+      if (w is! Map || w['start_ts'] is! num) continue;
+      final type = (w['title'] ?? w['type'] ?? 'Activity').toString();
+      // A known sport shows its own name and icon; a detected workout not
+      // named yet reads plain "Activity", as WHOOP's does.
+      final sport =
+          type == kUnnamedWorkoutType ? null : activityByName(type);
+      final name = sport?.name ??
+          (type.isEmpty || type == kUnnamedWorkoutType
+              ? 'Activity'
+              : '${type[0].toUpperCase()}${type.substring(1).replaceAll('_', ' ')}');
+      final strain = (w['strain'] as num?)?.toDouble();
+      final start = (w['start_ts'] as num).toInt();
+      final end = (w['end_ts'] as num?)?.toInt();
+      DateTime at(int sec) => DateTime.fromMillisecondsSinceEpoch(sec * 1000);
+      rows.add(_dayRow(
+          c,
+          p,
+          sport?.icon ?? LucideIcons.activity,
+          C.strain,
+          name,
+          // No strain scored, no number in the pill — a dash, never a zero.
+          strain?.toStringAsFixed(1) ?? '—',
+          hhmm(start),
+          end == null ? '' : hhmm(end),
+          () => go(c, DayStrainDetail(day: past ?? d.cycleDay)),
+          // WHOOP's "Edit activity": the sport and the times, right here
+          // instead of three screens deep. Not for a live session: it has
+          // no end to edit yet.
+          onEdit: w['id'] is String && end != null && w['status'] != 'live'
+              ? () => go(
+                  c,
+                  LogWorkout(
+                    sessionId: w['id'] as String,
+                    start: at(start),
+                    end: at(end),
+                    activity: sport,
+                    title: 'Edit activity',
+                  ))
+              : null));
+    }
+  }
+  Widget action(IconData icon, String label, VoidCallback onTap) => Expanded(
+        child: Pressable(
+          onTap: onTap,
+          semanticLabel: label,
+          child: Container(
+            padding: const EdgeInsets.symmetric(vertical: S.x3),
+            decoration: BoxDecoration(color: p.card2, borderRadius: R.rMd),
+            child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+              Icon(icon, size: 16, color: p.ink),
+              const SizedBox(width: S.x2),
+              Flexible(
+                child: Text(label.toUpperCase(),
+                    maxLines: 1,
+                    overflow: TextOverflow.fade,
+                    softWrap: false,
+                    style: F.over.copyWith(
+                        color: p.ink, letterSpacing: 1.2,
+                        fontWeight: FontWeight.w700)),
+              ),
+            ]),
+          ),
+        ),
+      );
+  return Surface(
+    child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Text(past == null ? "TODAY'S ACTIVITIES" : 'ACTIVITIES',
+          style: F.over.copyWith(
+              color: p.ink, letterSpacing: 1.6, fontWeight: FontWeight.w700)),
+      const SizedBox(height: S.x3),
+      if (rows.isEmpty)
+        Padding(
+          padding: const EdgeInsets.only(bottom: S.x3),
+          child: Text(
+              past != null
+                  ? 'No sleep or activity recorded on this day.'
+                  : 'Nothing synced for today yet. Your sleep and workouts '
+                      'show up here after the band syncs.',
+              style: F.body.copyWith(color: p.ink3)),
+        )
+      else
+        for (final r in rows) ...[r, const SizedBox(height: S.x2)],
+      const SizedBox(height: S.x1),
+      if (past == null) Row(children: [
+        action(LucideIcons.plus, 'Add activity',
+            () => go(c, const LogWorkout())),
+        const SizedBox(width: S.x2),
+        action(LucideIcons.timer, 'Start activity',
+            () => repoOf(c) == null
+                ? ShellScope.maybeOf(c)?.select(ShellDomain.workout)
+                : openActivityPicker(c)),
+      ]),
+    ]),
+  );
+}
+
+/// Days in a row with a recovery score, ending today or yesterday (today's
+/// may not have landed yet). 0 when the run is already broken. Pure.
+int recoveryStreak(List<({int t, double v})> pts, DateTime now) {
+  final days = {
+    for (final p in pts) dayLabelOf(DateTime.fromMillisecondsSinceEpoch(p.t * 1000)),
+  };
+  var d = DateTime(now.year, now.month, now.day);
+  if (!days.contains(dayLabelOf(d))) d = DateTime(d.year, d.month, d.day - 1);
+  var n = 0;
+  while (days.contains(dayLabelOf(d))) {
+    n++;
+    d = DateTime(d.year, d.month, d.day - 1);
+  }
+  return n;
+}
+
+/// The two tiles under the dials, WHOOP-style: Health Monitor (how many of
+/// the overnight vitals sit in the reader's own usual range) and Stress
+/// Monitor (the latest daytime reading, 0–3). Each opens its Health tab.
+class MonitorTiles extends StatefulWidget {
+  final HomeData d;
+  final VoidCallback onHealth, onStress;
+  const MonitorTiles(
+      {super.key,
+      required this.d,
+      required this.onHealth,
+      required this.onStress});
+
+  @override
+  State<MonitorTiles> createState() => _MonitorTilesState();
+}
+
+class _MonitorTilesState extends State<MonitorTiles> {
+  /// Today's scored 15-minute windows on the 0–3 scale, oldest first. The
+  /// level waits for [kStressMinMinutes] of them.
+  List<StressReading> _readings = const [];
+
+  /// The day [_readings] are from when it is not today: the held-over day,
+  /// before today has a night to score stress against.
+  String? _readingsDay;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadStress();
+  }
+
+  /// Home hands a NEW HomeData after every reload (a sync landed), and this
+  /// State outlives it — so re-read, or the tile keeps its first answer all
+  /// day.
+  @override
+  void didUpdateWidget(MonitorTiles old) {
+    super.didUpdateWidget(old);
+    if (!identical(old.d, widget.d)) _loadStress();
+  }
+
+  Future<void> _loadStress() async {
+    final repo = repoOf(context);
+    if (repo == null) return;
+    try {
+      final today = todayLabel();
+      var day = today;
+      var r = stressReadings(await repo.getDayStress(today), today);
+      // Stress is scored against the night's resting heart rate, so a day
+      // whose night has not happened yet has none; until then the held-over
+      // day is the current one, as on the rings.
+      final held = widget.d.heldOverNight;
+      if (r.isEmpty && held != null && held != today) {
+        day = held;
+        r = stressReadings(await repo.getDayStress(held), held);
+      }
+      r.sort((a, b) => a.at.compareTo(b.at));
+      if (mounted) {
+        setState(() => (_readings = r, _readingsDay = day == today ? null : day));
+      }
+    } catch (_) {}
+  }
+
+  /// The overnight vitals the Health Monitor judges, counted the same way
+  /// (normalRangeOf: newest point against the earlier nights). Only those with
+  /// a range count; none with a range → null, and the tile says so.
+  ///
+  /// Only LAST NIGHT is judged (a point dated today): a newest point from days
+  /// ago is not today's status, and "Within range" on it was a stale verdict
+  /// in the today slot. [ranged] says whether any range exists at all, so the
+  /// tile can tell "no reading today" from "range still building".
+  ///
+  /// Until today has a sleep of its own, Home holds the previous night over
+  /// ([HomeData.heldOverNight]) and that night is still the current one:
+  /// WHOOP's day runs until the next sleep, so at 03:00 before bed it still
+  /// shows the night before. [lastSleep] says the verdict is that night's.
+  ({(int, int)? counts, bool ranged, bool lastSleep}) _inRange() {
+    var inside = 0, total = 0;
+    var ranged = false, lastSleep = false;
+    final heldOver = widget.d.heldOverNight;
+    for (final k in const ['resp_rate', 'resting_hr', 'hrv', 'skin_temp']) {
+      final pts = widget.d.series[k] ?? const [];
+      final r = normalRangeOf(pts).range;
+      if (r == null || pts.isEmpty) continue;
+      ranged = true;
+      final newest = pts.reduce((a, b) => b.t > a.t ? b : a);
+      final day =
+          dayLabelOf(DateTime.fromMillisecondsSinceEpoch(newest.t * 1000));
+      final held = heldOver != null && day == heldOver;
+      if (daysBehind(newest.t) != 0 && !held) continue;
+      if (held) lastSleep = true;
+      total++;
+      if (r.contains(newest.v)) inside++;
+    }
+    return (
+      counts: total == 0 ? null : (inside, total),
+      ranged: ranged,
+      lastSleep: lastSleep,
+    );
+  }
+
+  @override
+  Widget build(BuildContext c) {
+    final p = P.of(c);
+    final (counts: hr, :ranged, :lastSleep) = _inRange();
+    final r = _readings;
+    final last = stressEnough(r) ? r.last : null;
+    final v = last?.v;
+    final lvl = v == null ? null : stressLevelOf(v);
+    // WHOOP's Home pair: a title with a chevron, one big figure, a word under
+    // it, and one small line of context.
+    Widget tile(String title, VoidCallback onTap, String semantics, Widget body,
+            String sub) =>
+        Expanded(
+          child: Surface(
+            onTap: onTap,
+            semanticLabel: '$title. $semantics. $sub',
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Expanded(
+                  child: Text(title.toUpperCase(),
+                      style: F.over.copyWith(
+                          color: p.ink, letterSpacing: 1.6, fontWeight: FontWeight.w700)),
+                ),
+                Icon(LucideIcons.chevronRight, size: 18, color: p.ink3),
+              ]),
+              const SizedBox(height: S.x3),
+              body,
+              const Spacer(),
+              const SizedBox(height: S.x2),
+              Text(sub, style: F.cap.copyWith(color: p.ink2)),
+            ]),
+          ),
+        );
+    Widget figure(String big, Color bigCol, String word, Color wordCol) =>
+        Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(big, style: F.n34.copyWith(color: bigCol)),
+          ),
+          Text(word.toUpperCase(),
+              maxLines: 2,
+              style: F.over.copyWith(
+                  color: wordCol, letterSpacing: 1.4, fontWeight: FontWeight.w700)),
+        ]);
+    final all = hr != null && hr.$1 == hr.$2;
+    final hCol = hr == null ? p.ink3 : p.on(all ? C.green : C.orange);
+    final hWord = hr == null
+        ? (ranged ? 'No reading' : 'Building range')
+        : all
+            ? 'Within range'
+            : 'Outside range';
+    final sCol = lvl == null ? p.ink3 : p.on(kStressLevelColors[lvl]);
+    final sWord = lvl == null
+        ? (r.isEmpty ? 'No reading' : 'Calculating')
+        : kStressLevelWords[lvl];
+    return Padding(
+      padding: const EdgeInsets.only(top: S.x4),
+      child: IntrinsicHeight(
+        child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          tile(
+            'Health Monitor',
+            widget.onHealth,
+            hr == null ? hWord : '${hr.$1} of ${hr.$2} $hWord',
+            Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Container(
+                width: 30,
+                height: 30,
+                margin: const EdgeInsets.only(top: S.x1, right: S.x2),
+                decoration: BoxDecoration(
+                    color: p.wash(hr == null ? C.n500 : (all ? C.green : C.orange)),
+                    borderRadius: R.rSm),
+                child: Icon(
+                    hr == null
+                        ? LucideIcons.minus
+                        : all
+                            ? LucideIcons.check
+                            : LucideIcons.triangleAlert,
+                    size: 18,
+                    color: hCol),
+              ),
+              Expanded(
+                child: figure(hr == null ? '—' : '${hr.$1}/${hr.$2}',
+                    hr == null ? p.ink3 : p.ink, hWord, hCol),
+              ),
+            ]),
+            hr == null
+                ? (ranged ? 'Not yet today' : 'Needs 7 nights')
+                : lastSleep
+                    ? 'Last sleep'
+                    : 'Last night',
+          ),
+          const SizedBox(width: S.x3),
+          tile(
+            'Stress Monitor',
+            widget.onStress,
+            v == null ? sWord : '${v.toStringAsFixed(1)}, $sWord',
+            Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              figure(v == null ? '—' : v.toStringAsFixed(1),
+                  v == null ? p.ink3 : p.ink, sWord, sCol),
+              if (r.length >= 2) ...[
+                const SizedBox(height: S.x2),
+                SizedBox(height: 32, child: StressSparkline(r)),
+              ],
+            ]),
+            last != null
+                ? 'as of ${_readingsDay == null ? '' : daysBehind(last.at.millisecondsSinceEpoch ~/ 1000) == 1 ? 'yesterday ' : '$_readingsDay '}'
+                    '${clock(last.at.hour * 60 + last.at.minute)}'
+                : r.isEmpty
+                    ? 'Not yet today'
+                    : '${stressMinutes(r)} of $kStressMinMinutes min',
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+/// WHOOP's floating coach line, at the foot of Home: the coach's mark and
+/// one sentence — today's briefing when one was written, otherwise an
+/// invitation to ask. Home shows it only when a coach is set up; with none,
+/// there is nothing behind it to open.
+class CoachBubble extends StatelessWidget {
+  /// Today's one-line briefing, or null when none has been written yet.
+  final String? oneLiner;
+  final VoidCallback onTap;
+  const CoachBubble({super.key, required this.oneLiner, required this.onTap});
+
+  @override
+  Widget build(BuildContext c) {
+    final p = P.of(c);
+    final text = oneLiner ?? 'Ask the coach about your day';
+    return Pressable(
+      onTap: onTap,
+      semanticLabel: oneLiner == null ? text : 'Coach: $text',
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(S.x2, S.x2, S.x4, S.x2),
+        decoration: BoxDecoration(
+          color: p.card2,
+          borderRadius: R.rPill,
+          border: Border.all(color: p.line),
+          boxShadow: [
+            BoxShadow(color: p.bg.withValues(alpha: .6), blurRadius: 16),
+          ],
+        ),
+        child: Row(children: [
+          Container(
+            width: 44,
+            height: 44,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              border: Border.all(color: p.on(kCoachAccent), width: 2),
+            ),
+            child: Icon(LucideIcons.sparkles, size: 20, color: p.on(kCoachAccent)),
+          ),
+          const SizedBox(width: S.x3),
+          Expanded(
+            child: Text(text,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: F.body.copyWith(
+                    color: oneLiner == null ? p.ink2 : p.ink,
+                    fontWeight: FontWeight.w600)),
+          ),
+          const SizedBox(width: S.x2),
+          Icon(LucideIcons.chevronUp, size: 20, color: p.ink2),
+        ]),
+      ),
+    );
+  }
+}
+
+/// "Did you work out?" on Home: the detector's newest unreviewed bout, one
+/// tap from the existing review screen where it is logged or dismissed.
+/// Nothing is logged from here. Absent when there is nothing waiting or
+/// auto-detection is off (see [activeSuggestions]).
+class DetectedWorkoutCard extends StatefulWidget {
+  final String? dayId;
+  const DetectedWorkoutCard({super.key, this.dayId});
+
+  @override
+  State<DetectedWorkoutCard> createState() => _DetectedWorkoutCardState();
+}
+
+class _DetectedWorkoutCardState extends State<DetectedWorkoutCard>
+    with RevisionReload {
+  List<Suggestion> _all = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final token = beginRead(#suggestions);
+    final day = widget.dayId;
+    final s = await activeSuggestions();
+    if (stillNewest(#suggestions, token)) {
+      setState(() => _all = [
+        for (final suggestion in s)
+          if (day == null || dayLabelOf(DateTime.fromMillisecondsSinceEpoch(
+              suggestion.startTs * 1000)) == day)
+            suggestion,
+      ]);
+    }
+  }
+
+  @override
+  void reload() => _load();
+
+  @override
+  void didUpdateWidget(covariant DetectedWorkoutCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.dayId != widget.dayId) {
+      _all = const [];
+      _load();
+    }
+  }
+
+  @override
+  Widget build(BuildContext c) {
+    if (_all.isEmpty) return const SizedBox.shrink();
+    final p = P.of(c);
+    final s = _all.reduce((a, b) => b.startTs > a.startTs ? b : a);
+    final at = DateTime.fromMillisecondsSinceEpoch(s.startTs * 1000);
+    final what = s.activity?.name.toLowerCase() ?? 'workout';
+    final more = _all.length - 1;
+    return Padding(
+      padding: const EdgeInsets.only(top: S.x3),
+      child: Surface(
+        onTap: () async {
+          // Through themedRoute like every other Home drill-down (see `go`),
+          // awaited so the card re-reads what the review screen changed.
+          await Navigator.of(c).push(themedRoute<void>(
+              (_) => WorkoutSuggestionScreen(preloaded: _all),
+              name: 'WorkoutSuggestionScreen'));
+          if (mounted) _load();
+        },
+        semanticLabel: 'Review a detected workout',
+        child: Row(children: [
+          Icon(LucideIcons.radar, size: 18, color: p.ink3),
+          const SizedBox(width: S.x3),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(
+                  'Did you do a ${s.durationMin}-minute $what at '
+                  '${clock(at.hour * 60 + at.minute)}?',
+                  style: F.body.copyWith(color: p.ink)),
+              Text(
+                  more > 0
+                      ? 'Review · $more more waiting'
+                      : 'Review to log it or dismiss it',
+                  style: F.cap.copyWith(color: p.ink3)),
+            ]),
+          ),
+          Icon(LucideIcons.chevronRight, size: 16, color: p.ink3),
+        ]),
+      ),
+    );
+  }
+}
+
+/// Tonight's wind-down reminder, switched from where the bedtime is shown.
+/// The same preference as Notifications → Wind-down; flipping it re-arms the
+/// OS reminders through AppState, which works the time back from tonight's
+/// band alarm when one is armed.
+class WindDownToggle extends StatefulWidget {
+  const WindDownToggle({super.key});
+
+  @override
+  State<WindDownToggle> createState() => _WindDownToggleState();
+}
+
+class _WindDownToggleState extends State<WindDownToggle> {
+  NotificationPrefs? _prefs;
+
+  @override
+  void initState() {
+    super.initState();
+    NotificationPrefs.load().then((p) {
+      if (mounted) setState(() => _prefs = p);
+    });
+  }
+
+  Future<void> _flip() async {
+    final p = _prefs;
+    if (p == null) return;
+    final next = p.copyWith(windDownEnabled: !p.windDownEnabled);
+    setState(() => _prefs = next);
+    await next.save();
+    if (!mounted) return;
+    await context.read<AppState>().refreshAiReminders();
+  }
+
+  @override
+  Widget build(BuildContext c) {
+    final p = P.of(c);
+    final on = _prefs?.windDownEnabled ?? false;
+    return Pressable(
+      semanticLabel: 'Wind-down reminder, ${on ? 'on' : 'off'}',
+      onTap: _prefs == null ? null : _flip,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: S.x3),
+        child: Row(children: [
+          Icon(LucideIcons.moonStar, size: 18, color: p.ink3),
+          const SizedBox(width: S.x3),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Wind-down reminder', style: F.body.copyWith(color: p.ink)),
+              Text(
+                  '${NotificationCenter.windDownBeforeBedMin} minutes before '
+                  'bedtime',
+                  style: F.cap.copyWith(color: p.ink3)),
+            ]),
+          ),
+          Text(on ? 'On' : 'Off',
+              style: F.cap.copyWith(
+                  color: on ? p.on(C.green) : p.ink3,
+                  fontWeight: FontWeight.w600)),
+        ]),
+      ),
+    );
+  }
+}
+
+/// After a low recovery, one line: the input that pulled it down most, and a
+/// door to something the app already has — a few minutes of paced breathing.
+///
+/// The driver is the glass box's own: named only when it landed outside the
+/// reader's usual spread, and pulling DOWN (negative contribution). No
+/// named driver, no reason given — the line then just offers the session.
+/// It makes no claim about what breathing will do to tomorrow's score.
+Widget? recoveryTip(BuildContext c, HomeData d, VoidCallback openBreathing) {
+  final v = d.readiness.value;
+  if (v == null || d.heldOverNight != null || readinessBand(v).tier > 1) {
+    return null;
+  }
+  final p = P.of(c);
+  Map<String, dynamic>? worst;
+  for (final e in d.drivers) {
+    final w = e['contribution'];
+    if (w is num && w < 0 &&
+        (worst == null || w < (worst['contribution'] as num))) {
+      worst = e;
+    }
+  }
+  final why = switch (worst?['label']?.toString()) {
+    null => 'Recovery is low today',
+    'hrv' => 'HRV is below your usual',
+    'rhr' => 'Resting heart rate is above your usual',
+    'resp' => 'Breathing rate is off your usual',
+    'temp' => 'Skin temperature is off your usual',
+    final k => '${driverLabel(k)} pulled recovery down',
+  };
+  return Padding(
+    padding: const EdgeInsets.only(top: S.x3),
+    child: Surface(
+      onTap: openBreathing,
+      semanticLabel: '$why. Try a five-minute breathing session.',
+      child: Row(children: [
+        Icon(LucideIcons.wind, size: 18, color: p.ink3),
+        const SizedBox(width: S.x3),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(why, style: F.body.copyWith(color: p.ink)),
+            Text('Try a 5-minute breathing session',
+                style: F.cap.copyWith(color: p.ink3)),
+          ]),
+        ),
+        Icon(LucideIcons.chevronRight, size: 16, color: p.ink3),
+      ]),
+    ),
+  );
+}
+
+/// The morning read under the rings: one sentence on what recovery and last
+/// night's sleep mean together. It repeats none of the rings' numbers — they
+/// are right above it — only says what they add up to.
+///
+/// Null unless today's own recovery is in: a held-over night is not this
+/// morning's, and a sentence about it would be.
+Widget? morningCard(BuildContext c, HomeData d) {
+  final v = d.readiness.value;
+  if (v == null || d.heldOverNight != null) return null;
+  final p = P.of(c);
+  final tier = readinessBand(v).tier;
+  final recovery = switch (tier) {
+    3 => 'You are well recovered',
+    2 => 'Your recovery is steady',
+    _ => 'Your body is asking for rest',
+  };
+  final slept = d.sleepMin.value, need = d.sleepNeedMin.value;
+  final perf = (slept == null || need == null || need <= 0) ? null : slept / need;
+  final sleep = perf == null
+      ? '.'
+      : perf >= .95
+          ? ' and you slept close to what you needed.'
+          : perf >= .8
+              ? ', on a little less sleep than you needed.'
+              : ', on a lot less sleep than you needed.';
+  final advice = switch (tier) {
+    3 => 'A harder day is fine.',
+    2 => 'A normal day suits you.',
+    _ => 'Keep today easy and get to bed early.',
+  };
+  return Padding(
+    padding: const EdgeInsets.only(top: S.x3),
+    child: Surface(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('THIS MORNING', style: F.over.copyWith(color: p.ink3)),
+        const SizedBox(height: S.x2),
+        Text('$recovery$sleep $advice',
+            style: F.head.copyWith(color: p.ink)),
+      ]),
+    ),
+  );
+}
+
+/// One activity, WHOOP-style: a filled pill with the icon and the score,
+/// the name in spaced capitals, start over end at the right with a bar in
+/// the activity's colour.
+Widget _dayRow(BuildContext c, P p, IconData icon, Color col, String name,
+        String value, String start, String end, VoidCallback onTap,
+        {VoidCallback? onEdit, String? measurementLabel}) =>
+    Pressable(
+      semanticLabel: '$name, $value${measurementLabel == null ? '' : ' $measurementLabel'}, $start to $end',
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(S.x2, S.x2, S.x3, S.x2),
+        decoration: BoxDecoration(color: p.card2, borderRadius: R.rMd),
+        child: Row(children: [
+          Container(
+            width: 104,
+            height: 44,
+            padding: const EdgeInsets.symmetric(horizontal: S.x3),
+            decoration: BoxDecoration(color: p.on(col), borderRadius: R.rSm),
+            child: Row(children: [
+              Icon(icon, size: 20, color: p.bg),
+              const SizedBox(width: S.x2),
+              Expanded(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text(value, style: F.n24.copyWith(color: p.bg)),
+                ),
+              ),
+            ]),
+          ),
+          const SizedBox(width: S.x3),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(name.toUpperCase(),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: F.over.copyWith(
+                    color: p.ink, letterSpacing: 1.6, fontWeight: FontWeight.w700)),
+              if (measurementLabel != null)
+                Text(measurementLabel, maxLines: 2,
+                    style: F.cap.copyWith(color: p.ink2)),
+            ]),
+          ),
+          Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+            Text(start, style: F.cap.copyWith(color: p.ink2)),
+            if (end.isNotEmpty) Text(end, style: F.cap.copyWith(color: p.ink2)),
+          ]),
+          const SizedBox(width: S.x2),
+          Container(
+            width: 2,
+            height: 30,
+            decoration: BoxDecoration(color: p.on(col), borderRadius: R.rPill),
+          ),
+          if (onEdit != null)
+            Pressable(
+              onTap: onEdit,
+              semanticLabel: 'Edit $name',
+              child: SizedBox(
+                width: S.tap,
+                height: S.tap,
+                child: Icon(LucideIcons.pencil, size: 18, color: p.ink2),
+              ),
+            ),
+        ]),
+      ),
+    );
+
+// ─────────────── weekly insight ───────────────
+
+/// This week against the last 30 days, for the three nightly signals. Null
+/// (the card hides) until at least one has 4 days this week and 14 in the
+/// month — a comparison on less is noise stated as a finding.
+Widget? insightCard(BuildContext c, HomeData d) {
+  final p = P.of(c);
+  final now = DateTime.now();
+  int sec(int back) =>
+      DateTime(now.year, now.month, now.day - back).millisecondsSinceEpoch ~/ 1000;
+  final weekFrom = sec(7), monthFrom = sec(30);
+
+  ({String k, double week, double month, double rel, int days})? best;
+  var any = false;
+  for (final k in const ['hrv', 'resting_hr', 'sleep']) {
+    final pts = d.series[k] ?? const [];
+    final week = [for (final x in pts) if (x.t >= weekFrom) x.v];
+    final month = [for (final x in pts) if (x.t >= monthFrom) x.v];
+    if (week.length < 4 || month.length < 14) continue;
+    any = true;
+    double mean(List<double> v) => v.reduce((a, b) => a + b) / v.length;
+    final w = mean(week), m = mean(month);
+    if (m == 0) continue;
+    final rel = (w - m) / m.abs();
+    if (best == null || rel.abs() > best.rel.abs()) {
+      best = (k: k, week: w, month: m, rel: rel, days: month.length);
+    }
+  }
+  if (!any) return null;
+
+  final String line;
+  final String sub;
+  final b = best;
+  if (b == null || b.rel.abs() < .05) {
+    line = 'A steady week.';
+    sub = 'HRV, resting heart rate and sleep are all within 5% of your '
+        '30-day average.';
+  } else {
+    final pct = (b.rel.abs() * 100).round();
+    final dir = b.rel > 0 ? 'above' : 'below';
+    final name = switch (b.k) {
+      'hrv' => 'HRV',
+      'resting_hr' => 'resting heart rate',
+      _ => 'sleep',
+    };
+    line = 'Your $name averaged ${_fmt(b.k, b.week)}${_unit(b.k).isEmpty ? '' : ' ${_unit(b.k)}'} '
+        'this week, $pct% $dir your 30-day average.';
+    sub = 'Compared with ${_fmt(b.k, b.month)}${_unit(b.k).isEmpty ? '' : ' ${_unit(b.k)}'} '
+        'over the last ${b.days} days.';
+  }
+  return Surface(
+    onTap: () => go(c, MetricDetail(best?.k ?? 'hrv')),
+    child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Container(
+        width: 38,
+        height: 38,
+        decoration: BoxDecoration(color: p.wash(p.accent), borderRadius: R.rMd),
+        child: Icon(LucideIcons.lightbulb, size: 18, color: p.on(p.accent)),
+      ),
+      const SizedBox(width: S.x3),
+      Expanded(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(line,
+              style: F.body.copyWith(color: p.ink, fontWeight: FontWeight.w600)),
+          const SizedBox(height: S.x1),
+          Text(sub, style: F.cap.copyWith(color: p.ink3)),
+        ]),
+      ),
+    ]),
+  );
+}
+
+// ─────────────── journal check-in ───────────────
+
+Widget journalCard(BuildContext c) => ActionCard(
+      'How did yesterday go?',
+      'Log alcohol, late meals, caffeine and more, and see what moves your '
+          'recovery.',
+      'Log it',
+      LucideIcons.notebookPen,
+      C.blue,
+      onTap: () => go(c, const JournalCompose()),
+    );
+
+/// "Sat 26" — short enough for a dashboard subtitle to stay one line.
+String _short(String dayId) {
+  final d = DateTime.tryParse(dayId);
+  if (d == null) return dayId;
+  const wd = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  return '${wd[d.weekday - 1]} ${d.day}';
+}
+
+// ─────────────── WHOOP's other dashboard rows ───────────────
+//
+// The six rows WHOOP's dashboard carries that `metric_series` does not: a
+// day's average heart rate, sleep needed, the week's minutes in zones 1–3 and
+// 4–5, the week's strength time, and today's stress line. Each comes from
+// what is already stored (the day results, the sessions, today's coach and
+// stress windows) — nothing new is computed beyond adding minutes up.
+
+/// The extra rows' names, units and icons; [specOf] knows only charted
+/// metrics.
+const _extraSpecs = <String, MetricSpec>{
+  'avg_hr': MetricSpec(
+      chartKey: 'avg_hr',
+      title: 'Average heart rate',
+      unit: 'bpm',
+      icon: LucideIcons.heartPulse,
+      higherBetter: false),
+  'sleep_need': MetricSpec(
+      chartKey: 'sleep_need',
+      title: 'Sleep needed',
+      icon: LucideIcons.bedDouble,
+      higherBetter: false),
+  'zones_13': MetricSpec(
+      chartKey: 'zones_13',
+      title: 'HR zones 1-3 (weekly)',
+      icon: LucideIcons.activity),
+  'zones_45': MetricSpec(
+      chartKey: 'zones_45',
+      title: 'HR zones 4-5 (weekly)',
+      icon: LucideIcons.flame),
+  'strength_min': MetricSpec(
+      chartKey: 'strength_min',
+      title: 'Strength activity time',
+      icon: LucideIcons.dumbbell),
+  'vo2max': MetricSpec(
+      chartKey: 'vo2max', title: 'VO₂ max', icon: LucideIcons.gauge),
+  'sleep_perf': MetricSpec(
+      chartKey: 'sleep_perf', title: 'Sleep performance', icon: LucideIcons.moon),
+  'restorative_pct': MetricSpec(
+      chartKey: 'restorative_pct',
+      title: 'Restorative sleep (%)',
+      icon: LucideIcons.batteryCharging),
+  'restorative_h': MetricSpec(
+      chartKey: 'restorative_h',
+      title: 'Restorative sleep (hours)',
+      icon: LucideIcons.batteryCharging),
+  'sleep_debt': MetricSpec(
+      chartKey: 'sleep_debt',
+      title: 'Sleep debt',
+      icon: LucideIcons.hourglass,
+      higherBetter: false),
+  'consistency': MetricSpec(
+      chartKey: 'consistency', title: 'Sleep consistency', icon: LucideIcons.repeat),
+  'zones_all': MetricSpec(
+      chartKey: 'zones_all', title: 'HR zones all (weekly)', icon: LucideIcons.heart),
+  'time_in_bed': MetricSpec(
+      chartKey: 'time_in_bed', title: 'Time in bed', icon: LucideIcons.bed),
+  'weight': MetricSpec(chartKey: 'weight', title: 'Weight', icon: LucideIcons.scale),
+  'lean_mass': MetricSpec(
+      chartKey: 'lean_mass', title: 'Lean body mass', icon: LucideIcons.personStanding),
+  'stress_graph': MetricSpec(
+      chartKey: 'stress', title: 'Stress monitor', icon: LucideIcons.brain),
+};
+
+MetricSpec _dashSpec(String k) => _extraSpecs[k] ?? specOf(k);
+
+/// Whether [k] is one of the rows [dashExtraSeries] reads, not a charted
+/// series.
+bool isDashExtra(String k) => _extraSpecs.containsKey(k);
+
+/// A point at local noon of [day] — the same day key the dashboard compares.
+ChartPoint _at(String day, double v) {
+  final d = DateTime.parse(day);
+  return (t: DateTime(d.year, d.month, d.day, 12).millisecondsSinceEpoch ~/ 1000, v: v);
+}
+
+/// One point per day: the sum of [perDay] over that day and the six before
+/// it, for every day that has at least one value in its window. A week with
+/// nothing measured has no point — never a zero week.
+List<ChartPoint> rollingWeek(Map<String, double> perDay, String fromDay, String toDay) {
+  final out = <ChartPoint>[];
+  final a = DateTime.parse(fromDay), b = DateTime.parse(toDay);
+  for (var d = a; !d.isAfter(b); d = DateTime(d.year, d.month, d.day + 1)) {
+    var sum = 0.0;
+    var any = false;
+    for (var i = 0; i < 7; i++) {
+      final v = perDay[dayLabelOf(DateTime(d.year, d.month, d.day - i))];
+      if (v != null) {
+        sum += v;
+        any = true;
+      }
+    }
+    if (any) out.add(_at(dayLabelOf(d), sum));
+  }
+  return out;
+}
+
+/// The extra rows' histories, from 40 days of stored days and sessions.
+/// Each read stands alone; a failed one costs its row.
+Future<Map<String, List<ChartPoint>>> dashExtraSeries([LocalRepository? repo]) async {
+  final now = DateTime.now();
+  final to = dayLabelOf(now);
+  final from = dayLabelOf(DateTime(now.year, now.month, now.day - 40));
+  final out = <String, List<ChartPoint>>{};
+  try {
+    final hr = await LocalDb.dayAvgHr(from, to);
+    out['avg_hr'] = [
+      for (final e in (hr.entries.toList()..sort((x, y) => x.key.compareTo(y.key))))
+        _at(e.key, e.value),
+    ];
+  } catch (_) {}
+  try {
+    final z = await LocalDb.dayZoneMinutes(from, to);
+    double? sum(List<double?> v, int a, int b) {
+      final xs = [for (var i = a; i < b; i++) ?v[i]];
+      return xs.isEmpty ? null : xs.reduce((p, q) => p + q);
+    }
+
+    out['zones_13'] = rollingWeek(
+        {for (final e in z.entries) e.key: ?sum(e.value, 0, 3)},
+        from,
+        to);
+    out['zones_45'] = rollingWeek(
+        {for (final e in z.entries) e.key: ?sum(e.value, 3, 5)},
+        from,
+        to);
+    out['zones_all'] = rollingWeek(
+        {for (final e in z.entries) e.key: ?sum(e.value, 0, 5)},
+        from,
+        to);
+  } catch (_) {}
+  try {
+    final since = DateTime(now.year, now.month, now.day - 47).millisecondsSinceEpoch ~/ 1000;
+    final perDay = <String, double>{};
+    for (final r in await LocalDb.strengthSessionsSince(since)) {
+      final ts = (r['start_ts'] as num?)?.toInt();
+      final m = (r['duration_min'] as num?)?.toDouble();
+      if (ts == null || m == null) continue;
+      final sec = ts > 1000000000000 ? ts ~/ 1000 : ts;
+      final day = dayLabelOf(DateTime.fromMillisecondsSinceEpoch(sec * 1000));
+      perDay[day] = (perDay[day] ?? 0) + m;
+    }
+    // Strength is a real zero on a week with none logged: the sessions table
+    // is the whole record of it, so an empty week is 0 minutes, not unknown.
+    final weeks = rollingWeek(perDay, from, to);
+    final byDay = {for (final p in weeks) p.t: p.v};
+    out['strength_min'] = [
+      for (var d = DateTime.parse(from);
+          !d.isAfter(DateTime.parse(to));
+          d = DateTime(d.year, d.month, d.day + 1))
+        (t: DateTime(d.year, d.month, d.day, 12).millisecondsSinceEpoch ~/ 1000,
+         v: byDay[DateTime(d.year, d.month, d.day, 12).millisecondsSinceEpoch ~/ 1000] ?? 0),
+    ];
+  } catch (_) {}
+  if (repo != null) out.addAll(await sleepDashSeries(repo));
+  return out;
+}
+
+/// The sleep, VO₂ max and profile rows, from what is already stored: the
+/// nightly series, the runs that banked a VO₂ max, the coach's debt and
+/// regularity for today, and the weight in the profile. Each read stands
+/// alone; a failed one costs only its rows.
+Future<Map<String, List<ChartPoint>>> sleepDashSeries(LocalRepository repo) async {
+  final out = <String, List<ChartPoint>>{};
+  try {
+    out['sleep_perf'] = pointsOf(await repo.getChart('sleep_perf'));
+  } catch (_) {}
+  try {
+    Map<String, ChartPoint> byDay(Object? chart) => {
+          for (final p in pointsOf(chart))
+            dayLabelOf(DateTime.fromMillisecondsSinceEpoch(p.t * 1000)): p,
+        };
+    final tst = byDay(await repo.getChart('sleep'));
+    final deep = byDay(await repo.getChart('deep'));
+    final rem = byDay(await repo.getChart('rem'));
+    final eff = byDay(await repo.getChart('efficiency'));
+    out.addAll(restorativeSeries(tst, deep, rem, eff));
+  } catch (_) {}
+  try {
+    final n = DateTime.now();
+    final from = DateTime(n.year, n.month - 6, n.day).millisecondsSinceEpoch ~/ 1000;
+    out['vo2max'] = vo2Points(await repo.getSessions(from: from, includeDetected: false));
+  } catch (_) {}
+  try {
+    final cd = await repo.getInsights();
+    final debtH = envValue(cd['sleep_debt'])?['debt_hours'] as num?;
+    final sri = envValue(cd['regularity'])?['sri'] as num?;
+    if (debtH != null) out['sleep_debt'] = [_at(todayLabel(), debtH * 60.0)];
+    if (sri != null) out['consistency'] = [_at(todayLabel(), sri.toDouble())];
+  } catch (_) {}
+  try {
+    final w = (await repo.getProfile())['weight_kg'] as num?;
+    if (w != null && w > 0) out['weight'] = [_at(todayLabel(), w.toDouble())];
+  } catch (_) {}
+  return out;
+}
+
+/// Per night: restorative minutes (deep + REM), restorative share of time
+/// asleep, and time in bed (asleep over efficiency — the stage card's own
+/// reading). A night missing any input has no point for that row.
+Map<String, List<ChartPoint>> restorativeSeries(
+    Map<String, ChartPoint> tst,
+    Map<String, ChartPoint> deep,
+    Map<String, ChartPoint> rem,
+    Map<String, ChartPoint> eff) {
+  final days = tst.keys.toList()..sort();
+  final h = <ChartPoint>[], pct = <ChartPoint>[], bed = <ChartPoint>[];
+  for (final d in days) {
+    final t = tst[d]!;
+    final dp = deep[d]?.v, rm = rem[d]?.v, ef = eff[d]?.v;
+    if (dp != null && rm != null) {
+      h.add((t: t.t, v: dp + rm));
+      if (t.v > 0) pct.add((t: t.t, v: (dp + rm) / t.v * 100));
+    }
+    if (ef != null && ef > 0) bed.add((t: t.t, v: t.v / (ef / 100)));
+  }
+  return {'restorative_h': h, 'restorative_pct': pct, 'time_in_bed': bed};
+}
+
+/// Sleep needed tonight, from the coach — today only; the coach keeps no
+/// history of it, so this row has no 30-day average to show.
+List<ChartPoint> sleepNeedSeries(HomeData d) {
+  final v = d.sleepNeedMin.value;
+  return v == null ? const [] : [_at(todayLabel(), v.toDouble())];
+}
+
+/// WHOOP's Stress Monitor row: today's newest level and the day's line.
+class StressDashRow extends StatefulWidget {
+  const StressDashRow({super.key});
+
+  @override
+  State<StressDashRow> createState() => _StressDashRowState();
+}
+
+class _StressDashRowState extends State<StressDashRow> {
+  /// The last 24 hours with sleep and workouts — the Stress Monitor's own
+  /// read, so the row shows what the screen behind it shows.
+  StressDay? _d = StressDay.shown[todayLabel()];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final repo = repoOf(context);
+    if (repo == null) return;
+    try {
+      final d = await StressDay.load(repo, todayLabel());
+      if (mounted) setState(() => _d = d);
+    } catch (_) {}
+  }
+
+  @override
+  Widget build(BuildContext c) {
+    final p = P.of(c);
+    final d = _d;
+    final r = d == null
+        ? const <StressReading>[]
+        : (d.readings.toList()..sort((a, b) => a.at.compareTo(b.at)));
+    final last = stressEnough(r) ? r.last : null;
+    final v = last?.v;
+    final lvl = v == null ? null : stressLevelOf(v);
+    return Surface(
+      onTap: () => go(c, const StressMonitorScreen()),
+      semanticLabel: v == null
+          ? 'Stress monitor, not enough readings yet today'
+          : 'Stress monitor, ${v.toStringAsFixed(1)} ${kStressLevelWords[lvl!]}',
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(LucideIcons.brain, size: 20, color: p.ink3),
+          const SizedBox(width: S.x3),
+          Expanded(
+            child: Text('STRESS MONITOR',
+                style: F.over.copyWith(
+                    color: p.ink, letterSpacing: 1.6, fontWeight: FontWeight.w700)),
+          ),
+          if (lvl != null) ...[
+            Text(kStressLevelWords[lvl].toUpperCase(),
+                style: F.over.copyWith(
+                    color: p.on(kStressLevelColors[lvl]),
+                    letterSpacing: 1.2,
+                    fontWeight: FontWeight.w700)),
+            const SizedBox(width: S.x2),
+          ],
+          Text(v == null ? '—' : v.toStringAsFixed(1),
+              style: F.n34.copyWith(color: v == null ? p.ink3 : p.ink)),
+        ]),
+        // WHOOP's row: the day's line with a moon over sleep and a mark over
+        // each workout, ending at now.
+        if (d != null && d.window.length >= 2) ...[
+          const SizedBox(height: S.x3),
+          StressLine(
+            readings: d.window,
+            sleep: d.sleep,
+            work: d.work,
+            day: DateTime.parse(d.day),
+            from: d.from,
+            to: d.to,
+            markEnd: d.isToday,
+            height: 96,
+          ),
+        ] else ...[
+          const SizedBox(height: S.x2),
+          Text(r.isEmpty ? 'No readings yet today' : 'Calculating',
+              style: F.cap.copyWith(color: p.ink3)),
+        ],
+      ]),
+    );
+  }
+}
+
+/// WHOOP's Day In Review card at the top of My Day: the coach's own line
+/// about today, opening the full briefing. Only when one was written.
+class DayInReviewCard extends StatelessWidget {
+  final String text;
+  final VoidCallback onTap;
+  const DayInReviewCard({super.key, required this.text, required this.onTap});
+
+  @override
+  Widget build(BuildContext c) {
+    final p = P.of(c);
+    return Surface(
+      onTap: onTap,
+      semanticLabel: 'Day in review: $text',
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(LucideIcons.sparkles, size: 18, color: p.on(kCoachAccent)),
+          const SizedBox(width: S.x2),
+          Expanded(
+            child: Text('DAY IN REVIEW',
+                style: F.over.copyWith(
+                    color: p.ink, letterSpacing: 1.6, fontWeight: FontWeight.w700)),
+          ),
+          Icon(LucideIcons.chevronRight, size: 18, color: p.ink3),
+        ]),
+        const SizedBox(height: S.x2),
+        Text(text, style: F.body.copyWith(color: p.ink, height: 1.4)),
+      ]),
+    );
+  }
+}
+
+// ─────────────── My Plan: this week's goals ───────────────
+
+/// One weekly goal: what it asks, and on how many of the week's days it was
+/// met so far.
+typedef WeekGoal = ({String name, int met, int days});
+
+/// WHOOP's My Plan goals for the calendar week (Monday to Sunday) holding
+/// [now]: sleep performance and sleep efficiency at or above the person's own
+/// average of the 30 days before the week, and the step goal. A goal with
+/// under [kBaselineMin] days to average is left out, never set to a made-up
+/// target; a day with no value does not count as met.
+List<WeekGoal> weekGoals(
+    Map<String, List<ChartPoint>> series, int stepGoal, DateTime now) {
+  final monday = DateTime(now.year, now.month, now.day - (now.weekday - 1));
+  final weekDays = [for (var i = 0; i < 7; i++) dayLabelOf(DateTime(monday.year, monday.month, monday.day + i))];
+  Map<String, double> byDay(String k) => {
+        for (final p in series[k] ?? const <ChartPoint>[])
+          dayLabelOf(DateTime.fromMillisecondsSinceEpoch(p.t * 1000)): p.v,
+      };
+  double? usual(Map<String, double> m) {
+    final from = dayLabelOf(DateTime(monday.year, monday.month, monday.day - 30));
+    final start = weekDays.first;
+    final xs = [
+      for (final e in m.entries)
+        if (e.key.compareTo(from) >= 0 && e.key.compareTo(start) < 0) e.value,
+    ];
+    return xs.length < kBaselineMin ? null : xs.reduce((a, b) => a + b) / xs.length;
+  }
+
+  int met(Map<String, double> m, double target) =>
+      weekDays.where((d) => (m[d] ?? double.negativeInfinity) >= target).length;
+
+  final out = <WeekGoal>[];
+  for (final (k, label) in [('sleep_perf', 'Sleep performance'), ('efficiency', 'Sleep efficiency')]) {
+    final m = byDay(k);
+    final u = usual(m);
+    if (u != null) {
+      out.add((name: '${u.round()}%+ $label', met: met(m, u.roundToDouble()), days: 7));
+    }
+  }
+  if (stepGoal > 0) {
+    out.add((name: '${thousands(stepGoal)}+ steps', met: met(byDay('steps'), stepGoal.toDouble()), days: 7));
+  }
+  return out;
+}
+
+/// WHOOP's My Plan card: the week's goals with how many days each was met,
+/// how much of the week's plan is done, and the days left.
+class WeekPlanCard extends StatelessWidget {
+  final List<WeekGoal> goals;
+
+  /// Days of the week after today; 0 on Sunday.
+  final int daysLeft;
+  const WeekPlanCard({super.key, required this.goals, required this.daysLeft});
+
+  @override
+  Widget build(BuildContext c) {
+    final p = P.of(c);
+    final total = goals.fold<int>(0, (a, g) => a + g.days);
+    final done = goals.fold<int>(0, (a, g) => a + g.met);
+    final pct = total == 0 ? 0 : (done / total * 100).round();
+    return Surface(
+      semanticLabel: "This week's plan, $pct percent accomplished, "
+          '${daysLeft == 0 ? 'last day' : '$daysLeft days left'}. '
+          '${[for (final g in goals) '${g.name}: ${g.met} of ${g.days} days'].join('. ')}',
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text("THIS WEEK'S PLAN",
+                  style: F.over.copyWith(
+                      color: p.ink, letterSpacing: 1.6, fontWeight: FontWeight.w700)),
+              const SizedBox(height: 2),
+              Text(daysLeft == 0 ? 'Last day' : '$daysLeft ${daysLeft == 1 ? 'day' : 'days'} left',
+                  style: F.cap.copyWith(color: p.ink3)),
+            ]),
+          ),
+          Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+            Text('$pct%', style: F.n34.copyWith(color: p.ink)),
+            Text('ACCOMPLISHED',
+                style: F.over.copyWith(color: p.ink3, letterSpacing: 1.2)),
+          ]),
+        ]),
+        for (final g in goals) ...[
+          const SizedBox(height: S.x3),
+          Row(children: [
+            Expanded(
+              child: Text(g.name,
+                  style: F.body.copyWith(color: p.ink, fontWeight: FontWeight.w600)),
+            ),
+            Text('${g.met}/${g.days}',
+                style: F.n17.copyWith(color: g.met > 0 ? p.on(C.green) : p.ink3)),
+          ]),
+          const SizedBox(height: S.x1),
+          Row(children: [
+            for (var i = 0; i < g.days; i++) ...[
+              if (i > 0) const SizedBox(width: 3),
+              Expanded(
+                child: Container(
+                  height: 6,
+                  decoration: BoxDecoration(
+                      color: i < g.met ? p.on(C.green) : p.track,
+                      borderRadius: R.rPill),
+                ),
+              ),
+            ],
+          ]),
+        ],
+      ]),
+    );
+  }
+}

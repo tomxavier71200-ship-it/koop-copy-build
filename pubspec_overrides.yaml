@@ -1,0 +1,5 @@
+dependency_overrides:
+  openstrap_analytics:
+    path: local_packages/analytics
+  openstrap_protocol:
+    path: local_packages/protocol

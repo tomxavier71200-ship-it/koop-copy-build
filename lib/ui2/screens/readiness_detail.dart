@@ -1,0 +1,705 @@
+// RECOVERY — the headline, taken apart.
+//
+// Two producers meet on this screen and the copy says so rather than blending
+// them. "How today's number was made" IS the headline's own arithmetic (the
+// WHOOP-matched formula's stored parts, shown only when they sum to the dial);
+// "What went into it" is a parallel percentile view of the inputs from the
+// cross-day glass box. Presenting the second as if it decomposed the first
+// would be a small lie that is very hard to catch.
+
+import 'dart:convert' show jsonDecode;
+
+import 'package:flutter/material.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
+
+import '../../data/day_label.dart';
+import '../../data/db.dart';
+import '../../data/local_repository.dart';
+import '../../l10n/app_localizations.dart';
+import '../../models/metric.dart';
+import '../ui2.dart';
+import 'home_screen.dart';
+import 'investigate.dart';
+import 'detail_trends.dart';
+import 'metric_detail.dart';
+import 'more_screen.dart' show DoorRow;
+import 'wellness_screen.dart' show JournalFindings;
+
+class ReadinessData {
+  final Metric readiness;
+
+  /// The early estimate (short baseline) while [readiness] calibrates.
+  final Metric early;
+
+  /// True when [early] is the population rough guide (nights 1–4) rather
+  /// than the early estimate from the person's own nights.
+  final bool rough;
+  final List<Map<String, dynamic>> breakdown;
+  final int inputsUsed;
+
+  /// `readiness_absent_diag` off the stored bundle — per input `{value,
+  /// baseline_n}` plus the composite's own `note`. Produced on
+  /// EVERY day readiness comes back absent, and until now its only destination
+  /// was a Firebase breadcrumb: the app told its developer why the number was
+  /// missing and never told the person looking at the gap.
+  ///
+  /// Null when readiness scored, which is the same fact as the number existing.
+  final Map<String, dynamic>? absentDiag;
+
+  /// The last night that scored, when that is NOT today's.
+  ///
+  /// It is no longer the source of the number above — [overnightMetric]
+  /// refuses an older night, so the headline is today's or it is absent, and
+  /// the screen no longer wears a date in its nav bar claiming otherwise. What
+  /// is left is coverage: naming the night the data stops at, inside the
+  /// absence.
+  final String? heldOverNight;
+
+  /// DENSE — one slot per calendar day, `null` where no score was stored. The
+  /// chart under it is dated, and `seriesOf` (values only) cannot date
+  /// anything: a five-point series from five scattered weeks used to be drawn
+  /// as five consecutive days.
+  final List<double?> series;
+
+  /// The stored series behind the contributors and the weekly trends.
+  final Map<String, List<ChartPoint>> trends;
+
+  /// `readiness_method` off today's bundle: which formula made the number and,
+  /// for the WHOOP-matched one, its `parts` (see [recoveryPartRows]).
+  final Map<String, dynamic>? method;
+
+  const ReadinessData({
+    this.readiness = Metric.empty,
+    this.early = Metric.empty,
+    this.rough = false,
+    this.breakdown = const [],
+    this.inputsUsed = 0,
+    this.heldOverNight,
+    this.series = const [],
+    this.trends = const {},
+    this.absentDiag,
+    this.method,
+  });
+
+  /// One block off a stored day bundle — the absence diagnostic or the
+  /// recovery method. Read straight from `day_result` the way
+  /// `InvestigateData.load` reads `imported` — no repository accessor exists
+  /// and this is the only screen that wants them.
+  static Future<Map<String, dynamic>?> _bundleBlock(String? day, String key,
+      {String? under}) async {
+    if (day == null) return null;
+    final payload = (await LocalDb.dayResult(day))?['payload_json'];
+    if (payload is! String || !payload.contains('"$key"')) return null;
+    final b = jsonDecode(payload);
+    final parent = under == null ? b : (b is Map ? b[under] : null);
+    final block = parent is Map ? parent[key] : null;
+    return block is Map ? block.cast<String, dynamic>() : null;
+  }
+
+  static Future<ReadinessData> load(LocalRepository repo) async {
+    final today = await repo.getToday();
+    final cd = await repo.getInsights();
+    final chart = await repo.getChart('recovery');
+
+    final daily = today['daily'];
+    final gb = cd['readiness_glassbox'];
+    final v = envValue(gb) ?? const <String, dynamic>{};
+    final bd = v['breakdown'];
+
+    final readiness = overnightMetric(today, daily is Map ? daily['readiness'] : null);
+
+    return ReadinessData(
+      readiness: readiness,
+      early: overnightMetric(
+                      today, daily is Map ? daily['readiness_early'] : null)
+                  .value !=
+              null
+          ? overnightMetric(
+              today, daily is Map ? daily['readiness_early'] : null)
+          : overnightMetric(
+              today, daily is Map ? daily['readiness_rough'] : null),
+      rough: overnightMetric(
+                  today, daily is Map ? daily['readiness_early'] : null)
+              .value ==
+          null,
+      // `narrative` and the glass-box `score` are DELIBERATELY not read. Both
+      // belong to the deprecated percentile score, which bands at 70/40 while
+      // the headline composite bands at 61/37/26 (see `readinessBand`) —
+      // printing its verdict under the ring put "You're ready" directly
+      // beneath "45 · Take it easy". The
+      // breakdown below IS worth keeping; it is a parallel ranking of the same
+      // four inputs, and the footer now says so.
+      breakdown: [
+        for (final e in (bd is List ? bd : const []))
+          if (e is Map) e.cast<String, dynamic>(),
+      ],
+      inputsUsed: (v['inputs_used'] as num?)?.toInt() ?? 0,
+      heldOverNight: heldOverNightOf(today),
+      series: denseDays(pointsOf(chart), 90),
+      trends: await loadTrendSeries(
+          repo, const ['readiness', 'hrv', 'resting_hr', 'resp_rate', 'sleep_perf']),
+      // Only read when there is nothing to explain away — a scored day has no
+      // diag in its bundle anyway, and this is one more day_result decode.
+      //
+      // TODAY'S DAY, never the held-over one. The held-over night usually
+      // scored fine, so its diagnostic explains an absence that is not the one
+      // on screen: it would list four measured inputs under a card saying the
+      // number is missing. A day with no bundle has no diag and this comes back
+      // null, which is correct — the note on the metric is the reason then.
+      absentDiag: readiness.value != null
+          ? null
+          : await _bundleBlock(
+              (today['status'] as Map?)?['today_day']?.toString(),
+              'readiness_absent_diag'),
+      method: await _bundleBlock(
+          (today['status'] as Map?)?['today_day']?.toString(),
+          'readiness_method',
+          under: 'clinical'),
+    );
+  }
+}
+
+/// The rows of "How today's number was made", from a stored
+/// `readiness_method` block, or null when the number was not made by the
+/// WHOOP-matched formula (no parts) or [shown] is not the number the parts
+/// add up to — an explanation that does not sum to the dial is not shown.
+///
+/// Each row: label, how the input compared with the person's usual, and the
+/// points it added (null for an input that could not be measured). Inputs the
+/// formula weights 0 are left out; [RecoveryMadeOf.zeroWeighted] names them.
+({double intercept, double score, List<(String, String, double?)> rows})?
+    recoveryPartRows(Map<String, dynamic>? method, double? shown) {
+  final parts = method?['parts'];
+  if (parts is! Map || shown == null || !shown.isFinite) return null;
+  final score = (parts['score'] as num?)?.toDouble();
+  final intercept = (parts['intercept'] as num?)?.toDouble();
+  final list = parts['parts'];
+  if (score == null || !score.isFinite || intercept == null ||
+      !intercept.isFinite || list is! List) {
+    return null;
+  }
+  if ((score - shown).abs() > 1.0) return null;
+  const labels = {
+    'hrv': ('HRV', 'higher', 'lower'),
+    'rhr': ('Resting heart rate', 'higher', 'lower'),
+    'sleep': ('Sleep performance', 'better', 'worse'),
+    'resp': ('Breathing rate', 'higher', 'lower'),
+  };
+  final rows = <(String, String, double?)>[];
+  var total = intercept;
+  for (final p in list) {
+    if (p is! Map) return null;
+    final key = p['key']?.toString();
+    final l = labels[key];
+    final z = (p['z'] as num?)?.toDouble();
+    final points = (p['points'] as num?)?.toDouble();
+    if (l == null || points == null || !points.isFinite ||
+        (z != null && !z.isFinite) || (z == null && points != 0)) {
+      return null;
+    }
+    total += points;
+    if (key == 'resp') {
+      if (points != 0) return null; // this version cannot explain another model
+      continue;
+    }
+    final how = z == null
+        ? 'not measured, adds nothing'
+        : z.abs() < 0.5
+            ? 'about your usual'
+            : '${z > 0 ? l.$2 : l.$3} than your usual';
+    rows.add((l.$1, how, z == null ? null : points));
+  }
+  if ((total.clamp(1.0, 99.0) - score).abs() > 1.0) return null;
+  return (intercept: intercept, score: score, rows: rows);
+}
+
+/// "How today's number was made": the baseline, each input's points, the
+/// total — the same arithmetic that produced the dial (whoop_calibration.dart).
+class RecoveryMadeOf extends StatelessWidget {
+  final ({double intercept, double score, List<(String, String, double?)> rows})
+      made;
+  const RecoveryMadeOf(this.made, {super.key});
+
+  /// Inputs measured but given no weight by the current formula.
+  static const zeroWeighted =
+      'Breathing rate carries no weight in this model: in your WHOOP export '
+      'it did not help predict Recovery.';
+
+  @override
+  Widget build(BuildContext c) {
+    final p = P.of(c);
+    Widget line(String label, String? sub, String value, {Color? color}) =>
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: S.x3),
+          child: Row(children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(label, style: F.body.copyWith(color: p.ink)),
+                  if (sub != null)
+                    Text(sub, style: F.cap.copyWith(color: p.ink3)),
+                ],
+              ),
+            ),
+            Text(value, style: F.body.copyWith(color: color ?? p.ink)),
+          ]),
+        );
+    String pts(double v) => '${v >= 0 ? '+' : '−'}${v.abs().toStringAsFixed(1)}';
+    final raw = made.rows.fold(made.intercept, (sum, row) => sum + (row.$3 ?? 0));
+    return Surface(
+      pad: const EdgeInsets.symmetric(horizontal: S.x4),
+      child: Column(children: [
+        line('Your starting point', 'starting value of the fitted model',
+            made.intercept.toStringAsFixed(1)),
+        for (final (label, how, points) in made.rows) ...[
+          Divider(color: p.line, height: 1),
+          line(label, how, points == null ? '0' : pts(points),
+              color: points == null
+                  ? p.ink3
+                  : p.on(points >= 0 ? C.green : C.orange)),
+        ],
+        if (raw < 1 || raw > 99) ...[
+          Divider(color: p.line, height: 1),
+          line('Score limit', 'Recovery is limited to 1–99', pts(made.score - raw)),
+        ],
+        Divider(color: p.line, height: 1),
+        line('Recovery', null, '${made.score.round()}%'),
+        Padding(
+          padding: const EdgeInsets.only(bottom: S.x3),
+          child: Text('$zeroWeighted This is a personal estimate fitted to '
+              'previous scores, not an independently validated measurement '
+              'of recovery.', style: F.cap.copyWith(color: p.ink3)),
+        ),
+      ]),
+    );
+  }
+}
+
+class ReadinessDetail extends StatefulWidget {
+  final ReadinessData? data;
+  const ReadinessDetail({super.key, this.data});
+
+  @override
+  State<ReadinessDetail> createState() => _ReadinessDetailState();
+}
+
+class _ReadinessDetailState extends State<ReadinessDetail> {
+  ReadinessData? _d;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.data != null) {
+      _d = widget.data;
+      _loading = false;
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) => _load());
+  }
+
+  Future<void> _load() async {
+    final repo = repoOf(context);
+    if (repo == null) {
+      if (mounted) setState(() => _loading = false);
+      return;
+    }
+    try {
+      final d = await ReadinessData.load(repo);
+      if (mounted) setState(() => (_d = d, _loading = false));
+    } catch (_) {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext c) {
+    final p = P.of(c);
+    final l = AppLocalizations.of(c);
+    final d = _d ?? const ReadinessData();
+    final v = d.readiness.value;
+    final band = readinessBand(v, l);
+
+    // No date in the nav bar. It named the held-over night, and the headline
+    // can no longer BE that night — a date up here now would be labelling
+    // today's number with somebody else's day.
+    return detailScaffold(c, 'Recovery',
+        info: kInfoRecovery,
+        // Recovery is always today's, so the bar says TODAY, WHOOP-style.
+        center: dayCenter(todayLabel(), const [], (_) {}), [
+      if (_loading && _d == null) ...[
+        const SizedBox(height: S.x8),
+        const Center(child: CircularProgressIndicator()),
+      ] else ...[
+        if (v == null && d.early.value != null) ...[
+          // Still calibrating, with an early estimate: the same dial, faded,
+          // and saying plainly what it is.
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: S.x5),
+            child: Column(children: [
+              Opacity(
+                opacity: .7,
+                child: HeroDial(
+                  value: d.early.normalized(100),
+                  color: readinessBand(d.early.value, l).color,
+                  number: (t) => '${(d.early.value! * t).round()}%',
+                  label: d.rough ? 'Rough guide' : 'Early estimate',
+                ),
+              ),
+              const SizedBox(height: S.x4),
+              Text(
+                d.rough
+                    ? 'Your resting heart rate and breathing against typical '
+                        'adult values, not yet against you. From night 5 it '
+                        'uses your own nights; from night 15, the full score.'
+                    : 'From your first nights only. The full Recovery score '
+                        'starts once 14 nights of your own history are in.',
+                textAlign: TextAlign.center,
+                style: F.body.copyWith(color: p.ink3),
+              ),
+            ]),
+          ),
+        ],
+        if (v == null) ...[
+          // No `why:`. The pipeline records why readiness abstained on every
+          // day it does, and the "What was missing" section directly below is
+          // built from that record — a sentence written here was competing
+          // with the real answer one line down and winning.
+          StatusCard.forMetric(
+                  l?.readinessDetailNotScoredTitle ??
+                      'Recovery is not scored',
+                  d.readiness,
+                  // Where the data stops, appended to whatever the pipeline
+                  // said. Not a substitute for the reason and not a reading —
+                  // "the last one was Saturday" is a fact about coverage.
+                  gap: d.heldOverNight == null
+                      ? null
+                      : (l?.readinessDetailLastNightScored(
+                              prettyDay(d.heldOverNight, l)) ??
+                          'The last night scored was '
+                              '${prettyDay(d.heldOverNight, l)}.')) ??
+              const SizedBox.shrink(),
+          if (d.absentDiag != null)
+            Section(l?.readinessDetailWhatWasMissing ?? 'What was missing',
+                _absence(c, p, d.absentDiag!)),
+        ] else
+          // The hero: one dial in its band colour, straight on the page.
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: S.x5),
+            child: Column(children: [
+              RingHero(
+                tag: RingHero.of('recovery'),
+                child: HeroDial(
+                  value: d.readiness.normalized(100),
+                  color: band.color,
+                  number: (t) => '${(v * t).round()}%',
+                  label: 'Recovery',
+                ),
+              ),
+              // WHOOP mode: WHOOP's dial carries no word under it.
+              if (!Look.whoop) ...[
+                const SizedBox(height: S.x4),
+                Text(band.label,
+                    style: F.head.copyWith(color: p.on(band.color))),
+              ],
+            ]),
+          ),
+
+        // The arithmetic behind the dial — shown only when it sums to it.
+        // Not in WHOOP mode: WHOOP goes straight from the dial to the list.
+        if (recoveryPartRows(d.method, (v ?? d.early.value)?.toDouble()) case final made?
+            when !d.rough && !Look.whoop) ...[
+          Section("How today's number was made", RecoveryMadeOf(made)),
+          const SizedBox(height: S.x3),
+        ],
+
+        // WHOOP's contributor list: each input today, your 30-day average
+        // under it, the arrow coloured by whether the move is good for you.
+        if ([
+          for (final (k, label, icon, better) in kRecoveryInputs)
+            ?contributorFor(c, k, label, icon, better, d.trends[k] ?? const []),
+        ] case final rows when rows.isNotEmpty) ...[
+          ContributorsCard(rows: rows, footer: 'Today vs. last 30 days'),
+          const SizedBox(height: S.x3),
+        ],
+
+        // WHOOP web's Day Recovery: the same inputs, today beside yesterday.
+        if ([
+          for (final (k, label, f) in [
+            ('hrv', 'HRV', (double x) => '${x.round()}'),
+            ('resting_hr', 'Resting HR', (double x) => '${x.round()}'),
+            ('sleep_perf', 'Sleep', (double x) => '${x.round()}%'),
+          ])
+            if (todayAndYesterday(d.trends[k] ?? const []) case (final t, final y))
+              (label, t, y, f),
+        ] case final pairs
+            // Not in WHOOP mode: WHOOP's app has Behavior Insights next.
+            when !Look.whoop &&
+                pairs.any((r) => r.$2 != null || r.$3 != null)) ...[
+          DayPairCard(rows: pairs),
+          const SizedBox(height: S.x3),
+        ],
+
+        // WHOOP's Behavior Insights: what you log, against your recovery. The
+        // analysis is the journal's own (JournalFindings); this is its door
+        // from the screen where the question comes up.
+        DoorRow(LucideIcons.lightbulb, C.yellow, 'Behavior insights',
+            'What you log — alcohol, late meals, caffeine — against your recovery',
+            onTap: () => go(c, const JournalFindings())),
+        const SizedBox(height: S.x5),
+
+        // Not in WHOOP mode: WHOOP's Recovery goes from Behavior Insights
+        // to its week, and ends there.
+        if (!Look.whoop && d.breakdown.isNotEmpty) ...[
+          Section(l?.readinessDetailWhatWentIntoIt ?? 'What went into it',
+              _breakdown(c, p, d)),
+          const SizedBox(height: S.x4),
+          Surface(
+            elevation: 0,
+            color: p.card2,
+            child: Row(children: [
+              Expanded(
+                child: Text(
+                  l?.readinessDetailInputsFooter(
+                          d.inputsUsed, d.breakdown.length) ??
+                      '${d.inputsUsed}/${d.breakdown.length} inputs. Each one is '
+                          'ranked against your own history — a parallel view of the '
+                          'same inputs, not slices of the number above.',
+                  style: F.cap.copyWith(color: p.ink3, height: 1.5),
+                ),
+              ),
+            ]),
+          ),
+        ] else if (!Look.whoop && v != null)
+          Section(
+            l?.readinessDetailWhatWentIntoIt ?? 'What went into it',
+            StatusCard(
+              l?.readinessDetailNoBreakdownTitle ?? 'No breakdown yet',
+              l?.readinessDetailNoBreakdownBody ??
+                  'Ranking each input against your own history takes about two '
+                      'weeks of nights.',
+              icon: LucideIcons.listTree,
+            ),
+          ),
+
+        // Weekly trends, WHOOP's order: the score, then what drives it.
+        if (d.trends.values.any((s) => s.isNotEmpty)) ...[
+          Padding(
+            padding: const EdgeInsets.only(top: S.x6, bottom: S.x3),
+            child: Text('Weekly Trends', style: F.t2.copyWith(color: p.ink)),
+          ),
+          ...weeklyTrendCards(c, d.trends, const [
+            'readiness',
+            'hrv',
+            'resting_hr',
+            'resp_rate',
+            'sleep_perf',
+          ]),
+        ],
+
+        // The header used to say "Last 90 days" over a chart of five points.
+        // It says what is drawn.
+        if (!Look.whoop) ...[
+        Section(
+          _historyTitle(c, d),
+          !d.series.any((v) => v != null)
+              ? StatusCard(
+                  l?.readinessDetailNoHistoryTitle ?? 'No recovery history',
+                  l?.readinessDetailNoHistoryBody ?? '0 days scored.',
+                  fix: l?.readinessDetailWearOvernight ?? 'Wear the band overnight',
+                  icon: LucideIcons.chartLine,
+                )
+              : Surface(child: _history(c, d)),
+        ),
+        const SizedBox(height: S.x5),
+        investigateRow(c, () => go(c, const Investigate('readiness'))),
+        ],
+      ],
+    ]);
+  }
+
+  /// The last 90 CALENDAR days, trimmed to start at the first day that
+  /// actually has a score — so the x labels span real dates and the empty run
+  /// before the first sync is not drawn as ninety missing days.
+  List<double?> _window(ReadinessData d) {
+    final first = d.series.indexWhere((v) => v != null);
+    return first <= 0 ? d.series : d.series.sublist(first);
+  }
+
+  String _historyTitle(BuildContext c, ReadinessData d) {
+    final l = AppLocalizations.of(c);
+    final n = d.series.any((v) => v != null) ? _window(d).length : 0;
+    return n == 0
+        ? (l?.readinessDetailHistoryTitle ?? 'History')
+        : (l?.readinessDetailLastNDays(n) ??
+            'Last $n day${n == 1 ? '' : 's'}');
+  }
+
+  Widget _history(BuildContext c, ReadinessData d) {
+    final win = _window(d);
+    // Readiness is a 0–100 score and the axis says so — auto-scaling turned a
+    // 71-to-76 week into a chart that looked like a collapse and a recovery.
+    const axis = AxisSpec(min: 0, max: 100, ticks: 3, format: axisInt);
+    final p = P.of(c);
+    final l = AppLocalizations.of(c);
+    return ChartFrame(
+      title: 'Recovery',
+      unit: l?.readinessDetailUnit ?? '/100',
+      height: 120,
+      yAxis: axis,
+      // Slot 0 is `length - 1` days behind today, not `length` — the last slot
+      // IS today. MetricDetail draws the same `recovery` series and already
+      // counts it this way; the two screens dated one chart differently.
+      xLabels: [
+        l?.readinessDetailDaysAgo(win.length - 1) ??
+            '${win.length - 1} day${win.length == 2 ? '' : 's'} ago',
+        l?.readinessDetailToday ?? 'Today',
+      ],
+      series: win,
+      child: CustomPaint(
+        size: Size.infinite,
+        painter: LineChart(win, p.on(C.green), dots: false, t: animate(c, 1),
+            axis: axis),
+      ),
+    );
+  }
+
+  /// The pipeline's own absence diagnostic, one row per input. Two facts per
+  /// row and neither is inferred here: did last night produce this input, and
+  /// how many of your own nights are behind it. The line underneath explains
+  /// the composite's note rather than guessing a reason from the rows above it —
+  /// and it never turns a night count into a date, because nothing in the
+  /// pipeline knows when you will next wear the band.
+  Widget _absence(BuildContext c, P p, Map<String, dynamic> diag) {
+    final l = AppLocalizations.of(c);
+    final rows = <(String, String)>[];
+    for (final k in const ['hrv', 'rhr', 'resp', 'temp']) {
+      final e = diag[k];
+      if (e is! Map) continue;
+      final n = (e['baseline_n'] as num?)?.toInt() ?? 0;
+      rows.add((
+        driverLabel(k, l),
+        '${e['value'] == true ? (l?.readinessDetailMeasured ?? 'Measured') : (l?.readinessDetailNotMeasured ?? 'Not measured')} · '
+            '${l?.readinessDetailNightsOfHistory(n) ?? '$n night${n == 1 ? '' : 's'} of your own history'}',
+      ));
+    }
+    final note = diag['note']?.toString();
+    final need = needMessageFromNote(note);
+    final why = whyFromNote(note);
+    final tempUnverified =
+        note?.contains('temp: no settled fraction measured') ?? false;
+
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      if (rows.isNotEmpty)
+        Surface(
+          pad: const EdgeInsets.symmetric(horizontal: S.x4),
+          child: Column(children: [
+            for (var i = 0; i < rows.length; i++) ...[
+              if (i > 0) Divider(color: p.line, height: 1),
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: S.x3),
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(rows[i].$1, style: F.body.copyWith(color: p.ink)),
+                      Text(rows[i].$2,
+                          style: F.over.copyWith(color: p.ink3)),
+                    ]),
+              ),
+            ],
+          ]),
+        ),
+      const SizedBox(height: S.x3),
+      Text(
+        need != null
+            ? (l?.readinessDetailNeedSuffix(need) ??
+                '$need. Each input is ranked against your own nights, so the '
+                    'score cannot start before there are enough of them.')
+            : why ?? 'Koop could not qualify enough readings for this score.',
+        style: F.cap.copyWith(color: p.ink3, height: 1.5),
+      ),
+      if (tempUnverified) ...[
+        const SizedBox(height: S.x2),
+        Text(
+          'Skin temperature was excluded because Koop could not verify '
+          'that the band had settled against your skin.',
+          style: F.cap.copyWith(color: p.ink3, height: 1.5),
+        ),
+      ],
+    ]);
+  }
+
+  Widget _breakdown(BuildContext c, P p, ReadinessData d) {
+    final rows = d.breakdown;
+    // THE WEIGHT THAT WAS USED, not the catalog weight. The score is
+    // `wpsum / wsum` over the USABLE inputs only, so the raw .40/.30/.18/.12
+    // are what each input would have carried had everything been present — with
+    // skin temperature missing, HRV's 40% actually carried 45.5%.
+    final wsum = rows
+        .where((r) => r['used'] == true)
+        .fold<double>(0, (a, r) => a + ((r['weight'] as num?)?.toDouble() ?? 0));
+    return Surface(
+      pad: const EdgeInsets.symmetric(horizontal: S.x4),
+      child: Column(children: [
+        for (var i = 0; i < rows.length; i++) ...[
+          if (i > 0) Divider(color: p.line, height: 1),
+          _row(c, p, rows[i], wsum),
+        ],
+      ]),
+    );
+  }
+
+  Widget _row(BuildContext c, P p, Map<String, dynamic> r, double wsum) {
+    final l = AppLocalizations.of(c);
+    final key = r['label']?.toString() ?? '';
+    final raw = (r['weight'] as num?)?.toDouble();
+    final contribution = (r['weighted_contribution'] as num?);
+    final used = r['used'] == true;
+    final pastMdc = r['past_mdc'] == true;
+    // No weight, or an input that carried none, means no percentage — `?? 0`
+    // printed a confident "0% weight" for a number nobody reported.
+    final share = !used || raw == null || wsum <= 0 ? null : raw / wsum;
+
+    final parts = [
+      if (share != null)
+        l?.readinessDetailWeightPercent((share * 100).round()) ??
+            '${(share * 100).round()}% weight',
+      if (!used) l?.readinessDetailNotAvailable ?? 'not available',
+      if (used && contribution == null)
+        l?.readinessDetailContributionNotReported ?? 'contribution not reported',
+      // The temperature input is a raw sensor deviation, not a calibrated
+      // temperature. It gets said, every time.
+      if (key == 'temp')
+        l?.readinessDetailRelativeUncalibrated ?? 'relative, uncalibrated',
+      // An unlabelled glyph is not an explanation. This is the
+      // smallest-worthwhile-change gate, so it says what it means.
+      if (used && !pastMdc)
+        l?.readinessDetailWithinSpread ?? 'within your usual spread',
+    ];
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: S.x3),
+      child: Row(children: [
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(driverLabel(key), style: F.body.copyWith(color: p.ink)),
+            Text(parts.join(' · '),
+                style: F.over.copyWith(color: p.ink3)),
+          ]),
+        ),
+        // No contribution number means no number — never a bare em-dash. The
+        // sub-line above says which case it is.
+        if (used && contribution != null) ...[
+          const SizedBox(width: S.x3),
+          Text(
+            '${contribution >= 0 ? '+' : '−'}'
+            '${contribution.abs().toStringAsFixed(1)}',
+            style: F.n17.copyWith(
+                color: p.on(contribution >= 0 ? C.green : C.orange)),
+          ),
+        ],
+      ]),
+    );
+  }
+}

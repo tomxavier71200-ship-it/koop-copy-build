@@ -1,0 +1,784 @@
+// The token boundary. Nothing below this file defines a colour, a size, a
+// radius or a duration — everything else in lib/ui2 spends what is declared
+// here, and `test/ui2_tokens_test.dart` fails the build if it doesn't.
+//
+// Three things this file owns that the previous design system did not:
+//
+//   1. CONTRAST IS SOLVED, NOT ASSERTED. Muted ink and every accent used as
+//      text or as a fill are pushed to a WCAG AA (4.5:1) floor by `P.on` /
+//      `P.fill`, against the worst surface they can legally land on. The old
+//      caption token measured 2.20–2.71:1 across 223 call sites; a token that
+//      *can* be misused eventually is. `test/ui2_contrast_test.dart` proves
+//      the floor holds in both themes for every accent.
+//   2. MOTION IS GATED ONCE. `motion()` and `animate()` are the only way to
+//      get a non-zero duration, and they return `Duration.zero` when the
+//      platform asks for reduced motion. No call site can opt out, and the
+//      tokens test forbids `.repeat(` anywhere in lib/ui2 so an infinite loop
+//      can never survive the gate. That gate reaches the NAVIGATOR too:
+//      `buildTheme` installs a `pageTransitionsTheme` that returns the page
+//      unanimated (22 routes were sliding at full duration under Reduce
+//      Motion), and `sheetMotion()` does the same for the four modal sheets,
+//      which do not consult a theme at all. Dialogs still use Flutter's own
+//      fade-and-scale — small, centred, and the least nauseogenic of the
+//      three — so they are deliberately left alone.
+//   3. BOTH THEMES ARE DESIGNED. Every colour is defined for light and dark in
+//      the same expression. There is no token that exists only inside a
+//      dark-mode branch.
+
+import 'dart:math' as math;
+import 'package:flutter/material.dart';
+
+/// ── COLOUR ────────────────────────────────────────────────────────────────
+///
+/// Raw pigment. These are *not* safe to paint text with directly — most of
+/// them fail AA on white. Run them through [P.on] (accent as text) or
+/// [P.fill] (accent as a filled surface under [P.inkOnFill]) first.
+class C {
+  // primary
+  static const green = Color(0xFF22C55E);
+  static const greenD = Color(0xFF16A34A);
+  static const blue = Color(0xFF3B82F6);
+  static const purple = Color(0xFF8B5CF6);
+
+  // secondary
+  static const orange = Color(0xFFF97316);
+  static const red = Color(0xFFEF4444);
+  static const teal = Color(0xFF14B8A6);
+  static const yellow = Color(0xFFEAB308);
+  static const pink = Color(0xFFEC4899);
+  static const indigo = Color(0xFF6366F1);
+
+  /// Two light blues the ramps need and nothing else does: the light-sleep
+  /// lane sits between REM and deep, and zone 1 sits below `blue`. They live
+  /// here rather than inside the painters because a palette that is partly in
+  /// theme.dart and partly in charts.dart is two palettes.
+  static const sky = Color(0xFF7DD3FC);
+  static const blueSoft = Color(0xFF93C5FD);
+
+  /// The route ramp, and only the route ramp.
+  ///
+  /// Brighter and more saturated than the UI accents on purpose: this is the
+  /// one mark in the app that is drawn over an arbitrary photograph and a
+  /// darkened basemap rather than over a known surface, and the UI greens and
+  /// reds — tuned to clear 4.5:1 as TEXT on a card — go muddy there.
+  ///
+  /// Deliberately NOT in [all]. `all` is the set the contrast sweep measures
+  /// as ink and as fill, and these are neither: they are a line on a picture.
+  /// Putting them in would be asking the wrong question of them.
+  static const routeFast = Color(0xFF7CFF6B);
+  static const routeMid = Color(0xFFFFC83D);
+  static const routeHard = Color(0xFFFF8A30);
+  static const routeSlow = Color(0xFFFF4D4D);
+
+  /// The Koop mark's pigments (see koop_mark.dart), and nothing else's. Like
+  /// the route ramp they are not in [all]: a logo is a picture, not ink or a
+  /// fill the contrast sweep should judge. Each ring runs light to deep along
+  /// its diagonal; the tile runs top to bottom.
+  static const brandBlue0 = Color(0xFFF00000);
+  static const brandBlue1 = Color(0xFF280101);
+  static const brandGreen0 = Color(0xFF3F3C2C);
+  static const brandGreen1 = Color(0xFFFBFF00);
+  static const brandTile0 = Color(0xFF000000);
+  static const brandTile1 = Color(0xFF000305);
+  static const brandMono = Color(0xFFFFFFFF);
+
+  /// The basemap's two ends, which is the whole of the map's styling: every
+  /// tile pixel is mapped onto the line between them by `_themeFilter`.
+  ///
+  /// What makes the map READABLE is the distance between these two, not how
+  /// low either one is. Both ends have been wrong once:
+  ///
+  ///   · ceiling `#4A5568` — OSM's land polygon is near-white and lands on
+  ///     the ceiling, so the whole card became a mid-grey slab.
+  ///   · ceiling `#232B39` — dark enough that land, water and roads all
+  ///     collapsed into each other and the map vanished entirely. On a card
+  ///     with no photo the map IS the content, so that is worse.
+  ///
+  /// This pair keeps the card unmistakably dark while leaving enough range
+  /// between water, land and roads to read as a place. It is also the only
+  /// lever there is on the labels and street names, which are rendered into
+  /// the raster and cannot be asked for separately — they sit near the
+  /// ceiling, so a ceiling this far down leaves them as texture, not type.
+  static const mapFloor = Color(0xFF0A1018);
+  static const mapCeil = Color(0xFF44536D);
+
+  // neutrals
+  static const n900 = Color(0xFF0F172A);
+  static const n800 = Color(0xFF1E293B);
+  static const n600 = Color(0xFF475569);
+  static const n500 = Color(0xFF64748B);
+  static const n400 = Color(0xFF94A3B8);
+  static const n300 = Color(0xFFCBD5E1);
+  static const n200 = Color(0xFFE2E8F0);
+  static const n100 = Color(0xFFF1F5F9);
+  static const n50 = Color(0xFFF8FAFC);
+
+  static const white = Color(0xFFFFFFFF);
+
+  /// Each domain owns an accent — the mental map is colour-coded, and the map
+  /// is the point. These five are the five tabs, in order, forever.
+  static const domHome = green;
+  static const domHealth = blue;
+  static const domFood = orange;
+  static const domMove = purple;
+  static const domMind = teal;
+
+  /// The two score hues, WHOOP-style: strain is a vivid blue, sleep a quiet
+  /// steel blue. Named for what they mean so the screens that draw strain or
+  /// sleep agree without each picking a pigment.
+  static const strain = Color(0xFF1E9BFF);
+  static const sleep = Color(0xFF7BA1BB);
+
+  /// WHOOP's four sleep-stage hues, for the stage bars and the restorative
+  /// (deep + REM) charts: awake a pale grey, light a soft lavender, deep a
+  /// pink, REM a violet.
+  static const stageAwake = Color(0xFFCFD3D8);
+  static const stageLight = Color(0xFFA3A6F2);
+  static const stageDeep = Color(0xFFF48CF2);
+  static const stageRem = Color(0xFFA75BEA);
+
+  /// Every accent the contrast test sweeps. Adding a colour above without
+  /// adding it here means it ships unverified.
+  static const all = <Color>[
+    green, greenD, blue, purple, orange, red, teal, yellow, pink, indigo,
+    sky, blueSoft,
+    domHome, domHealth, domFood, domMove, domMind, strain, sleep,
+    stageAwake, stageLight, stageDeep, stageRem,
+  ];
+}
+
+/// ── SURFACES + LEGIBLE INK ────────────────────────────────────────────────
+///
+/// Brightness-resolved. `P.of(context)` in every build method.
+/// The dark surface family picked in Customize. Only surfaces change — the
+/// inks do not — and every family's [P.card2] is dark enough that [P.ink3]
+/// still clears 4.5:1 on it (slate, the lightest, measures 4.6:1).
+enum Skin {
+  // The default: true black with near-black hairline cards, the WHOOP look.
+  // bgTop carries a faint blue lift so the top of the page is not a void.
+  // The default: WHOOP's slate — a dark grey-blue page that fades darker
+  // toward the bottom, with raised slate cards. Not black: on black the
+  // cards read as holes; on slate they read as surfaces.
+  carbon('Carbon', [0xFF1E2227, 0xFF2A2F35, 0xFF31373E, 0xFF3A4048, 0xFF3B424A, 0xFF2D3339, 0xFF14171A]),
+  onyx('Onyx', [0xFF000000, 0xFF0F1113, 0xFF181B1E, 0xFF212529, 0xFF22262A, 0xFF0B1820, 0xFF000000]),
+  slate('Slate', [0xFF1B2229, 0xFF28313A, 0xFF303A43, 0xFF38424C, 0xFF3B454F, 0xFF2A343D, 0xFF12171C]),
+  midnight('Midnight', [0xFF0E1319, 0xFF19202A, 0xFF212935, 0xFF2A3340, 0xFF2C3542, 0xFF18202A, 0xFF06080B]),
+  graphite('Graphite', [0xFF1C1C1F, 0xFF28282C, 0xFF313136, 0xFF3A3A40, 0xFF3C3C42, 0xFF2C2C30, 0xFF111113]),
+  ocean('Deep blue', [0xFF0F2031, 0xFF182C40, 0xFF1F3550, 0xFF2A4260, 0xFF2C4563, 0xFF173450, 0xFF07121D]),
+  // WHOOP's own, sampled from the owner's WHOOP screenshots (2026-10-10): the
+  // page fades from #242F34 at the top to #0E1313 at the bottom, cards a step
+  // lighter (#262A2D), rows inside them #31373C. The "WHOOP look" switch.
+  // Re-measured 2026-10-26 down the page edge: #242F34 at the top, #14181B
+  // halfway, #0E1313 at the foot — the fade is steep, hence a middle stop
+  // (bg) in WHOOP mode. Cards #2B2F33 at their brightest (kWhoopCardGlow).
+  whoop('WHOOP', [0xFF14181B, 0xFF2B2F33, 0xFF31373C, 0xFF3A3F44, 0xFF3B4046, 0xFF242F34, 0xFF0E1313]);
+
+  final String label;
+
+  /// bg, card, card2, line, track, bgTop, bgBottom.
+  final List<int> argb;
+  const Skin(this.label, this.argb);
+
+  /// The page fade's ends, for a swatch of this family.
+  Color get top => Color(argb[5]);
+  Color get bottom => Color(argb[6]);
+}
+
+/// WHOOP mode's colours for Koop's accents, sampled from the owner's WHOOP
+/// screenshots (2026-10-10): recovery green / yellow / red off the weekly
+/// recovery bars, strain off its dial and bars, sleep off its dial, the
+/// Poor band's orange off the sleep legend. [P.on] returns these as they are.
+/// WHOOP's card fill, measured across its contributor card: brightest at
+/// the upper middle, falling off toward the edges and the foot.
+const kWhoopCardGlow = RadialGradient(
+  center: Alignment(0, -.35),
+  radius: 1.25,
+  colors: [Color(0xFF2B2F33), Color(0xFF1A1E21)],
+);
+
+/// WHOOP's Optimal band green, off its sleep legend (#00F09E) — its own
+/// teal-green, not the recovery green.
+const kWhoopOptimal = Color(0xFF00F09E);
+
+/// WHOOP mode's Health tab glow, measured off its screen: near black at the
+/// top left (#0A0A0A) under magenta-purple from the top right (#4B2151).
+const kWhoopGlowBase = LinearGradient(
+  begin: Alignment.topCenter,
+  end: Alignment.bottomCenter,
+  colors: [Color(0xFF0A0A0A), Color(0x000A0A0A)],
+);
+const kWhoopGlow = RadialGradient(
+  center: Alignment(1.1, -1.1),
+  radius: 1.3,
+  colors: [Color(0xFF4B2151), Color(0x992D1731), Color(0x002D1731)],
+  stops: [0, .5, 1],
+);
+
+/// The page fade, WHOOP mode: three stops, as WHOOP's falls steeply.
+LinearGradient pageFade(P p) => LinearGradient(
+      begin: Alignment.topCenter,
+      end: Alignment.bottomCenter,
+      colors: Look.whoop ? [p.bgTop, p.bg, p.bgBottom] : [p.bgTop, p.bgBottom],
+    );
+
+final kWhoopInk = <Color, Color>{
+  C.green: Color(0xFF16EC06),
+  C.yellow: Color(0xFFFEDE00),
+  C.red: Color(0xFFFF0026),
+  C.strain: Color(0xFF0093E7),
+  C.sleep: Color(0xFF7AA1BB),
+  C.orange: Color(0xFFFCA620),
+};
+
+/// How the score rings are drawn — Customize → Ring style.
+enum RingStyle { classic, thin, glow }
+
+/// The rest of Customize's look: set by ThemeController before it notifies,
+/// and stamped into the ThemeData (see [LookStamp]) so every reader repaints.
+class Look {
+  static RingStyle ring = RingStyle.thin;
+
+  /// Numbers in the selected text face instead of the condensed display face.
+  static bool rounded = false;
+
+  /// Tighter card padding and section gaps.
+  static bool compact = false;
+
+  /// Multiplies the system text size; 0.85–1.3.
+  static double textScale = 1.0;
+
+  /// Bumped on every Customize change (look, skin or accent).
+  static int rev = 0;
+
+  static double ringStroke(double classic) =>
+      ring == RingStyle.thin ? classic * .8 : classic;
+  static bool get glow => ring == RingStyle.glow;
+
+  /// Profile → Settings → WHOOP mode: WHOOP's surfaces AND its layout (the
+  /// three-tab bar with the coach disc, WHOOP's Health tab, thick dials).
+  /// Off is Koop's own layout, untouched.
+  static bool get whoop => P.skin == Skin.whoop;
+}
+
+/// A ThemeData extension whose only job is to differ when [Look] changes, so
+/// MaterialApp's theme compares unequal and `P.of`/`F` readers rebuild.
+class LookStamp extends ThemeExtension<LookStamp> {
+  final int rev;
+  const LookStamp(this.rev);
+
+  @override
+  LookStamp copyWith({int? rev}) => LookStamp(rev ?? this.rev);
+
+  @override
+  LookStamp lerp(LookStamp? other, double t) => other ?? this;
+
+  @override
+  bool operator ==(Object other) => other is LookStamp && other.rev == rev;
+
+  @override
+  int get hashCode => rev.hashCode;
+}
+
+/// The accent choices in Customize: the active tab mark, switches and links.
+const kAccents = <(String, Color)>[
+  ('Ice', Color(0xFF4FB3FF)),
+  ('Mint', Color(0xFF34E0A1)),
+  ('Violet', Color(0xFFA48CFF)),
+  ('Amber', Color(0xFFFFB547)),
+];
+
+class P {
+  final bool dark;
+  const P(this.dark);
+
+  /// The user's picks, set by ThemeController before it notifies. Global like
+  /// `AppColors.active`: MaterialApp rebuilds on the notify and the ThemeData
+  /// carries both (see ThemeController.darkTheme), so every `P.of` dependent
+  /// repaints.
+  static Skin skin = Skin.carbon;
+  static Color accentColor = kAccents.first.$2;
+
+  static P of(BuildContext c) => P(Theme.of(c).brightness == Brightness.dark);
+
+  Color _s(int i) => Color(skin.argb[i]);
+
+  // Dark is a cool slate by default, not black: a soft top-to-bottom fade
+  // behind lighter cards, so the cards read as raised without borders.
+  Color get bg => dark ? _s(0) : C.n50;
+  Color get card => dark ? _s(1) : C.white;
+  Color get card2 => dark ? _s(2) : C.n100;
+  Color get line => dark ? _s(3) : C.n200;
+  Color get track => dark ? _s(4) : C.n200;
+
+  /// The page fade's two ends (top, bottom). Only the shell paints it; a
+  /// pushed route sits on the flat [bg], which is the fade's midpoint.
+  Color get bgTop => dark ? _s(5) : C.n50;
+  Color get bgBottom => dark ? _s(6) : C.n50;
+
+  /// The user's accent. Decoration only — never text on a surface without
+  /// going through [on].
+  Color get accent => accentColor;
+
+  Color get ink => dark ? const Color(0xFFF4F6F8) : C.n900;
+  Color get ink2 => dark ? const Color(0xFFB9C2CC) : C.n600;
+
+  /// The muted caption ink. Hand-solved to clear 4.5:1 on [card2], the darkest
+  /// (light theme) / lightest (dark theme) surface it can sit on — so it is
+  /// legible on every surface, not just the one it was eyeballed against.
+  /// The values it replaces measured 4.34:1 and 3.21:1 respectively.
+  Color get ink3 => dark ? const Color(0xFF9CA7B3) : const Color(0xFF627188);
+
+  /// The ink that goes on top of a [fill]. White by construction — [fill]
+  /// darkens the accent until white clears AA on it.
+  Color get inkOnFill => C.white;
+
+  /// [accent] rendered as TEXT on one of this brightness' surfaces, nudged
+  /// toward the page ink until it clears [_aa] against the worst legal
+  /// surface ([card2]). `C.green` on white measures 2.28:1 raw; `on(C.green)`
+  /// measures 4.53:1 and still reads unmistakably green.
+  ///
+  /// Solved TWICE, against the two worst surfaces it can land on. `card2` is
+  /// the flat one; the other is `wash(accent)` over it — the Pill and the
+  /// active SubTabs chip put this ink on a tinted background nothing was
+  /// solving against, and five of six accents measured 4.30–4.49 there. The
+  /// solver only ever nudges toward the page ink, so clearing the second
+  /// surface cannot un-clear the first.
+  Color on(Color accent) {
+    // WHOOP mode: WHOOP's own score colours, exactly as measured off its
+    // screens, unnudged — WHOOP draws them bright on its dark cards.
+    if (Look.whoop) {
+      if (kWhoopInk[accent] case final w?) return w;
+    }
+    final toward = dark ? ink : C.n900;
+    final flat = _solve(accent, toward, card2, dark);
+    return _solve(flat, toward, Color.alphaBlend(wash(accent), card2), dark);
+  }
+
+  /// [accent] rendered as a FILLED surface under [inkOnFill], darkened until
+  /// white text on it clears [_aa]. Buttons, chips, CTA badges.
+  Color fill(Color accent) => _solve(accent, const Color(0xFF000000), C.white, false);
+
+  /// A tinted wash of [accent] — the InsightCard / Pill / active-tab
+  /// background. Never carries text of its own colour; pair it with [on].
+  ///
+  /// [strength] is capped at 1: full strength is the tint [on] and [ink3] were
+  /// solved against, and a caller asking for 1.6 was pushing muted ink to
+  /// 2.99:1 on its own card. A wash darker than a wash is a fill.
+  Color wash(Color accent, {double strength = 1}) =>
+      accent.withValues(alpha: (dark ? .18 : .11) * strength.clamp(0.0, 1.0));
+
+  List<BoxShadow> el(int level) {
+    if (level <= 0) return const [];
+    if (dark) {
+      return [
+        BoxShadow(
+          color: const Color(0xFF000000).withValues(alpha: .32 + level * .06),
+          blurRadius: 6.0 * level,
+          offset: Offset(0, level.toDouble()),
+        ),
+      ];
+    }
+    return [
+      BoxShadow(
+        color: C.n900.withValues(alpha: .04 + level * .015),
+        blurRadius: 5.0 * level,
+        offset: Offset(0, level * 1.2),
+      ),
+    ];
+  }
+
+  // ── the solver ──────────────────────────────────────────────────────────
+  // WCAG 2.1 AA for body text. Non-text UI is allowed 3:1, but a caption that
+  // is "technically an indicator" is how the 2.20:1 tokens got shipped, so
+  // there is one floor here and it is the strict one.
+  static const _aa = 4.5;
+
+  static final _cache = <int, Color>{};
+
+  /// Binary-search the lerp from [c] toward [toward] for the first colour that
+  /// clears [_aa] against [against]. 24 steps is well past 8-bit resolution.
+  static Color _solve(Color c, Color toward, Color against, bool dark) {
+    final key = Object.hash(c.toARGB32(), toward.toARGB32(),
+        against.toARGB32(), dark);
+    final hit = _cache[key];
+    if (hit != null) return hit;
+    var out = c;
+    if (contrast(c, against) < _aa) {
+      var lo = 0.0, hi = 1.0;
+      for (var i = 0; i < 24; i++) {
+        final mid = (lo + hi) / 2;
+        if (contrast(Color.lerp(c, toward, mid)!, against) >= _aa) {
+          hi = mid;
+        } else {
+          lo = mid;
+        }
+      }
+      out = Color.lerp(c, toward, hi)!;
+    }
+    // Bounded: one entry per (accent, brightness) pair actually used, and the
+    // accent set is a compile-time constant.
+    _cache[key] = out;
+    return out;
+  }
+
+  /// WCAG 2.1 contrast ratio, 1.0 … 21.0. Public so the contrast test and any
+  /// future palette work measure with exactly the same function the tokens do.
+  /// Luminance is `Color.computeLuminance()` — same WCAG formula, no need to
+  /// carry our own copy of it.
+  static double contrast(Color a, Color b) {
+    final la = a.computeLuminance(), lb = b.computeLuminance();
+    final hi = math.max(la, lb), lo = math.min(la, lb);
+    return (hi + 0.05) / (lo + 0.05);
+  }
+}
+
+/// ── TYPE ── 7 steps, 3 weights, tabular figures on anything that changes ──
+///
+/// Bundled Montserrat text and Barlow display numerals give every platform the
+/// same hierarchy, including offline rendering and font-loaded widget tests.
+class F {
+  // Owner-selected Montserrat text with a separate Barlow numeral ramp.
+  // Both faces are bundled, so the same typography works offline on iPhone,
+  // Android and web without depending on WHOOP's private font files.
+  static const _f = 'Montserrat';
+  static const _fb = ['Manrope'];
+  static const _tab = [FontFeature.tabularFigures()];
+
+  // The 7 steps.
+  static const display = TextStyle(
+      fontFamily: _f,
+      fontFamilyFallback: _fb,
+      fontSize: 30,
+      height: 40 / 30,
+      fontWeight: FontWeight.w700,
+      letterSpacing: -.6);
+  static const t1 = TextStyle(
+      fontFamily: _f,
+      fontFamilyFallback: _fb,
+      fontSize: 25,
+      height: 34 / 25,
+      fontWeight: FontWeight.w700,
+      letterSpacing: -.5);
+  static const t2 = TextStyle(
+      fontFamily: _f,
+      fontFamilyFallback: _fb,
+      fontSize: 19.5,
+      height: 28 / 19.5,
+      fontWeight: FontWeight.w600,
+      letterSpacing: -.3);
+  static const head = TextStyle(
+      fontFamily: _f,
+      fontFamilyFallback: _fb,
+      fontSize: 15,
+      height: 24 / 15,
+      fontWeight: FontWeight.w600,
+      letterSpacing: -.1);
+  // Shared hierarchy for Home sections and grouped settings.
+  static TextStyle get section => Look.whoop
+      ? head.copyWith(fontSize: 13, fontWeight: FontWeight.w700,
+          height: 20 / 13, letterSpacing: .7)
+      : head;
+  static TextStyle get settingsTitle => Look.whoop
+      ? head.copyWith(fontSize: 16, height: 22 / 16)
+      : body.copyWith(fontWeight: FontWeight.w600);
+  static const body = TextStyle(
+      fontFamily: _f,
+      fontFamilyFallback: _fb,
+      fontSize: 14.5,
+      height: 22 / 14.5,
+      letterSpacing: -.1);
+  static const cap = TextStyle(
+      fontFamily: _f,
+      fontFamilyFallback: _fb,
+      fontSize: 12,
+      height: 18 / 12,
+      letterSpacing: -.05);
+  static const over = TextStyle(
+      fontFamily: _f,
+      fontFamilyFallback: _fb,
+      fontSize: 10,
+      height: 14 / 10,
+      fontWeight: FontWeight.w600,
+      letterSpacing: .6);
+
+  // Numerals — a parallel display ramp in the condensed face: tall, bold and
+  // narrow, so a big number reads at a glance and still fits its card.
+  // Tabular, so a live value never jitters its own layout as digits change.
+  // Barlow Semi Condensed: DIN-style, the sporty stat face WHOOP's numbers
+  // read as, narrow enough that a value still fits the slot it was laid out in.
+  static const _n = 'Barlow Semi Condensed';
+  static const _c48 = TextStyle(
+      fontFamily: _n,
+      fontFamilyFallback: _fb,
+      fontSize: 48,
+      height: 1,
+      fontWeight: FontWeight.w600,
+      letterSpacing: -.5,
+      fontFeatures: _tab);
+  static const _c34 = TextStyle(
+      fontFamily: _n,
+      fontFamilyFallback: _fb,
+      fontSize: 34,
+      height: 1,
+      fontWeight: FontWeight.w600,
+      letterSpacing: -.3,
+      fontFeatures: _tab);
+  static const _c24 = TextStyle(
+      fontFamily: _n,
+      fontFamilyFallback: _fb,
+      fontSize: 24,
+      height: 1,
+      fontWeight: FontWeight.w600,
+      letterSpacing: 0,
+      fontFeatures: _tab);
+
+  /// Customize → Numbers → Rounded: the same ramp in the text face. Montserrat
+  /// is wider, so each step is drawn smaller to keep its old footprint, and
+  /// semibold rather than extra-bold: heavy numerals read as a toy.
+  static TextStyle _r(TextStyle c) => c.copyWith(
+      fontFamily: _f,
+      fontSize: c.fontSize! * .8,
+      fontWeight: FontWeight.w600,
+      letterSpacing: -.3);
+
+  /// WHOOP mode: the ramp in Barlow, the regular-width face. WHOOP's
+  /// numerals are wide and round (a DIN-style face licensed to WHOOP);
+  /// Barlow is the closest free one, matched side by side against them
+  /// (2026-10-26). A step smaller, as it is wider than the condensed face.
+  static TextStyle _w(TextStyle c) => c.copyWith(
+      fontFamily: 'Barlow',
+      fontSize: c.fontSize! * .9,
+      fontWeight: FontWeight.w700,
+      letterSpacing: 0);
+
+  /// The hero numeral: the one headline number a detail screen opens on,
+  /// inside its ring or gauge. One step, not a size per screen.
+  static TextStyle get hero => Look.whoop
+      ? _w(_c48).copyWith(fontSize: 64 * .9)
+      : (Look.rounded ? _r(_c48) : _c48).copyWith(
+          fontSize: 64 * (Look.rounded ? .8 : 1),
+          fontWeight: Look.rounded ? FontWeight.w600 : FontWeight.w500);
+  /// The hero numeral sized to its dial, as WHOOP's is: about three tenths
+  /// of the ring's width. The wordmark and label scale with it.
+  static TextStyle heroFor(double dial) =>
+      hero.copyWith(
+          fontSize: dial * .29 * (Look.rounded && !Look.whoop ? .8 : 1));
+  /// A trailing "%" at about half its numeral's size, WHOOP's "77%".
+  static TextStyle smallPercent(TextStyle n) =>
+      n.copyWith(fontSize: n.fontSize! * .55);
+  static TextStyle dialMark(double dial) => head.copyWith(fontSize: dial * .062);
+  static TextStyle dialLabel(double dial) => over.copyWith(fontSize: dial * .048);
+
+  /// A detail screen's contributor row at WHOOP's size: the label a step
+  /// over [over], the value larger than [n24].
+  static TextStyle get rowLabel => over.copyWith(fontSize: 11.5);
+  static TextStyle get rowValue => n24.copyWith(fontSize: 28);
+  static TextStyle get n48 =>
+      Look.whoop ? _w(_c48) : Look.rounded ? _r(_c48) : _c48;
+  static TextStyle get n34 =>
+      Look.whoop ? _w(_c34) : Look.rounded ? _r(_c34) : _c34;
+  static TextStyle get n24 =>
+      Look.whoop ? _w(_c24) : Look.rounded ? _r(_c24) : _c24;
+  static const n17 = TextStyle(
+      fontFamily: _f,
+      fontFamilyFallback: _fb,
+      fontSize: 17,
+      height: 1,
+      fontWeight: FontWeight.w700,
+      letterSpacing: 0,
+      fontFeatures: _tab);
+
+  /// The section and metric LABEL: small caps, bold, widely tracked —
+  /// "SLEEP DEBT", "HR ZONES". Pass text already upper-cased.
+  static const label = TextStyle(
+      fontFamily: _f,
+      fontFamilyFallback: _fb,
+      fontSize: 14,
+      height: 18 / 14,
+      fontWeight: FontWeight.w700,
+      letterSpacing: 1.6);
+}
+
+/// ── SPACING ── 4pt base ───────────────────────────────────────────────────
+class S {
+  static const x1 = 4.0;
+  static const x2 = 8.0;
+  static const x3 = 12.0;
+  static const x4 = 16.0;
+  static const x5 = 20.0;
+  static const x6 = 24.0;
+  static const x8 = 32.0;
+  static const x10 = 40.0;
+  static const x12 = 48.0;
+  static const x16 = 64.0;
+
+  /// The minimum comfortable target, enforced inside `Pressable`. Apple HIG
+  /// and WCAG 2.5.5 both land here.
+  static const tap = 44.0;
+}
+
+/// ── RADII ─────────────────────────────────────────────────────────────────
+class R {
+  static const sm = 8.0;
+  static const md = 12.0;
+  static const lg = 16.0;
+  static const xl = 24.0;
+  static const xxl = 32.0;
+  static const pill = 999.0;
+
+  static const rSm = BorderRadius.all(Radius.circular(sm));
+  static const rMd = BorderRadius.all(Radius.circular(md));
+  static const rLg = BorderRadius.all(Radius.circular(lg));
+  static const rXl = BorderRadius.all(Radius.circular(xl));
+  static const rXxl = BorderRadius.all(Radius.circular(xxl));
+  static const rPill = BorderRadius.all(Radius.circular(pill));
+}
+
+/// ── MOTION ── one gate, no exceptions ─────────────────────────────────────
+///
+/// The audit found zero reduced-motion support and 13 infinite `.repeat()`
+/// loops. Both are structural problems, so both get structural answers: these
+/// are the only durations in the system, and `test/ui2_tokens_test.dart`
+/// forbids `.repeat(` in lib/ui2 outright. Ambient motion that genuinely needs
+/// to loop takes its phase from a caller-owned value (see `BreathRing.t`), so
+/// the screen owns the ticker and the same gate stops it.
+class Motion {
+  /// True when the platform is NOT asking for reduced motion.
+  static bool enabled(BuildContext c) =>
+      MediaQuery.maybeDisableAnimationsOf(c) != true;
+
+  static const fast = Duration(milliseconds: 120);
+  static const base = Duration(milliseconds: 180);
+  static const slow = Duration(milliseconds: 280);
+
+  /// The session clock. A live workout counts REAL seconds, so this is the one
+  /// duration that must NOT pass through [motion] — reduced motion silences
+  /// animation, it does not stop time. It lives here because theme.dart is the
+  /// only file allowed to write a `Duration(…)`, and a screen inventing its own
+  /// tick is how thirteen ungated tickers happened last time.
+  static const tick = Duration(seconds: 1);
+
+  /// One full breath cycle for the paced-breathing ring — 5 s in, 5 s out is
+  /// the pace the breathing session already uses. The PHASE is still owned by
+  /// the screen (see `BreathRing.t`); this is only how long a cycle lasts, and
+  /// the screen must not start it at all when [enabled] is false.
+  static const breath = Duration(seconds: 5);
+
+  /// A ring sweeping to its value and its number counting up, once, when a
+  /// screen opens. Goes through [motion] like every other animation.
+  static const sweep = Duration(milliseconds: 1100);
+
+  /// Apple's spring, in its own two terms: [damping] (1 = no overshoot, the
+  /// default for everything; ~0.8 only after a flick) and [response] (how
+  /// quickly it reaches the target, in seconds — not a duration; a spring has
+  /// none). Springs start from where the thing IS and carry its speed, so a
+  /// moving page can be grabbed and reversed mid-flight.
+  static SpringDescription spring({double response = .35, double damping = 1}) =>
+      SpringDescription.withDampingRatio(
+        mass: 1,
+        stiffness: math.pow(2 * math.pi / response, 2).toDouble(),
+        ratio: damping,
+      );
+
+  /// The streak flame igniting: one bounce and a burst of sparks, played once
+  /// when the streak grows. Never a loop; through [motion] like the rest.
+  static const ignite = Duration(milliseconds: 900);
+
+  /// One pulse of the ECG capture screen's contact rings. Phase is owned by
+  /// the screen (like [breath]); nothing runs when [enabled] is false.
+  static const ecgPulse = Duration(seconds: 2);
+
+  /// The ECG live-preview repaint cadence: incoming packets only mark the
+  /// ring dirty, and the screen's clock repaints at most this often.
+  static const ecgPreviewTick = Duration(milliseconds: 100);
+}
+
+/// Collapse [d] to zero when the user has asked for reduced motion. Every
+/// `AnimatedFoo`, `AnimationController` and implicit transition in lib/ui2
+/// takes its duration from here.
+Duration motion(BuildContext c, Duration d) =>
+    Motion.enabled(c) ? d : Duration.zero;
+
+/// The animated-progress form: returns `1` (finished) instead of `t` when
+/// motion is off, so a chart that draws itself in still ends up fully drawn.
+double animate(BuildContext c, double t) => Motion.enabled(c) ? t : 1;
+
+/// The motion gate for `showModalBottomSheet`, which takes an [AnimationStyle]
+/// rather than reading [ThemeData.pageTransitionsTheme] like a route does.
+/// Null keeps the platform default; [AnimationStyle.noAnimation] cuts straight
+/// to the open sheet.
+AnimationStyle? sheetMotion(BuildContext c) =>
+    Motion.enabled(c) ? null : AnimationStyle.noAnimation;
+
+/// True once the user's text scale has passed the point where a card's header
+/// can no longer be one line. The number is not a device class — it is where
+/// `label · value · unit` stops fitting a phone's width — and it is shared so
+/// that every card that has to restack does it at the same moment.
+bool bigText(BuildContext c) => textScaleFor(c, F.body.fontSize!) > 1.3;
+
+/// Nonlinear accessibility scaling must be measured at the text's actual size.
+double textScaleFor(BuildContext c, double fontSize) =>
+    MediaQuery.textScalerOf(c).scale(fontSize) / fontSize;
+
+/// Apply Customize's multiplier without flattening the system's font curve.
+TextScaler adjustedTextScaler(TextScaler system, double preference) =>
+    preference == 1 ? system : _PreferenceTextScaler(system, preference);
+
+class _PreferenceTextScaler extends TextScaler {
+  final TextScaler system;
+  final double preference;
+  const _PreferenceTextScaler(this.system, this.preference);
+  @override
+  double scale(double fontSize) => system.scale(fontSize) * preference;
+  @override
+  double get textScaleFactor => scale(14) / 14;
+  @override
+  bool operator ==(Object other) => other is _PreferenceTextScaler &&
+      other.system == system && other.preference == preference;
+  @override
+  int get hashCode => Object.hash(system, preference);
+}
+
+/// Reduced motion has to reach the NAVIGATOR, not only the widgets inside it.
+/// `TransitionRoute` builds its controller straight from `transitionDuration`
+/// and never asks whether animations are disabled, so before this every push
+/// slid at full duration for exactly the people who turned the setting on —
+/// and a full-screen slide is the most nauseogenic thing the app does.
+///
+/// Sheets and dialogs do not consult a theme at all; those pass
+/// `AnimationStyle.noAnimation` at their call sites.
+class _Gated extends PageTransitionsBuilder {
+  /// Whatever the SDK ships for this platform — taken from the default theme
+  /// rather than named here, so the app keeps the native transition and this
+  /// gate does not quietly become a second opinion about what it should be.
+  final PageTransitionsBuilder inner;
+  const _Gated(this.inner);
+
+  @override
+  Widget buildTransitions<T>(PageRoute<T> route, BuildContext c,
+      Animation<double> animation, Animation<double> secondary, Widget child) {
+    if (!Motion.enabled(c)) return child;
+    return inner.buildTransitions(route, c, animation, secondary, child);
+  }
+}
+
+ThemeData buildTheme(Brightness b) {
+  final p = P(b == Brightness.dark);
+  return ThemeData(
+    brightness: b,
+    scaffoldBackgroundColor: p.bg,
+    colorScheme:
+        ColorScheme.fromSeed(seedColor: C.green, brightness: b, surface: p.card),
+    fontFamily: 'Montserrat',
+    fontFamilyFallback: const ['Manrope'],
+    splashFactory: NoSplash.splashFactory,
+    highlightColor: const Color(0x00000000),
+    pageTransitionsTheme: PageTransitionsTheme(builders: {
+      for (final e in const PageTransitionsTheme().builders.entries)
+        e.key: _Gated(e.value),
+    }),
+    // Differs whenever Customize changes the look, so every theme reader
+    // rebuilds — see [LookStamp].
+    extensions: [LookStamp(Look.rev)],
+  );
+}

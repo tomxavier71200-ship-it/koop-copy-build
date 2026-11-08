@@ -1,0 +1,2430 @@
+// onehz_pipeline.dart — the PURE, isolate-safe per-day analytics pipeline (V2).
+//
+// `deriveDayBundle` is a top-level function with NO DB / IO / Flutter binding
+// dependency, so it runs cleanly under `Isolate.run(...)` off the UI isolate.
+//
+// V2 INVARIANTS enforced here:
+//   * SINGLE-SOURCE SLEEP. The day already carries ONE `SleepSegmentation`
+//     (from analytics' segmentSleep, computed by the coordinator). Every sleep
+//     figure — TST/WASO/efficiency/nrem/rem/wake/hypnogram — comes from THAT one
+//     result. We never re-detect sleep or run a second estimator.
+//   * WINDOWS ARE FIRST-CLASS. HRV/RHR/recovery run over the SLEEP window only
+//     (the fix for the ~166 ms whole-day RMSSD bug). Strain (TRIMP) runs over the
+//     WAKE span. Resp/ODI/CPC run over sleep. No metric runs over "the whole
+//     capture".
+//   * HONEST BY TYPE. Every output keeps the {value,confidence,tier,inputs_used}
+//     Metric envelope; absent input → null/"—", never fabricated.
+//
+// CROSSING THE ISOLATE BOUNDARY (copied, not shared):
+//   IN  : a serialized `DayBundleInput` (the day's sliced 1 Hz substrate arrays +
+//         the precomputed sleep segmentation + the profile + baseline history).
+//   OUT : Map<String,dynamic> (plain JSON) — the full derived bundle, envelopes +
+//         the curve series the UI needs + indexed scalars. Survives jsonEncode.
+
+import 'dart:math' as math;
+import 'dart:typed_data';
+
+import 'package:openstrap_analytics/onehz.dart';
+
+// Pure value helper only — no DB, no IO, no Flutter binding — so importing it
+// does not compromise this file's isolate safety. It is here so the sex
+// normalisation has ONE definition across the pipeline and the coordinator
+// instead of two that can drift.
+import 'hr_max.dart'
+    show
+        estimatedMaxHr,
+        manualZoneBoundsFromProfile,
+        smoothedMaxHr,
+        hrCeilingForAge,
+        kHrFloorBpm,
+        smoothedMinHr,
+        trainingZones;
+import 'night_hrv.dart' show weightedNightRmssd;
+import 'quiet_level.dart' show personalQuietHrr;
+import 'whoop_calibration.dart'
+    show
+        calibratedRecoveryParts,
+        calibratedSleepPerformance,
+        whoopDayStrain,
+        whoopStrainCurve,
+        whoopStrainLoad;
+import 'profile.dart' show workoutSex;
+import 'step_cadence.dart' show cadenceSpmForMinutes;
+// Same argument: a pure `DateTime` lookup, no DB / IO / Flutter binding. It is
+// the ONE definition of "the UTC offset in effect at this instant" in the tree,
+// and a second copy here would be the exact drift SLP-09's timezone guard is
+// about.
+import 'substrate.dart' show tzOffsetSecondsAt;
+/// Below this nightly RMSSD (ms) the beat stream is stuck, not measured.
+const double kMinRmssdMs = 2.0;
+
+const MetricCfg _skinTempAdcCfg = MetricCfg(
+  minVal: 1.0,
+  maxVal: 65535.0,
+  floorSpread: 25.0,
+  halfLifeB: 14.0,
+  halfLifeS: 21.0,
+);
+
+/// MACHINE-READABLE "a required input was missing" note — the same
+/// `key:field=value` grammar as `need_baseline:have=H,need=N` (models/metric.dart
+/// parses that one) and analytics' `unknown_device_family:id=…`. One grammar,
+/// one parser per key; never a second format.
+///
+/// [name] is the INPUT that was absent, never the metric that wanted it. A
+/// screen has to be able to say what to do about it, and "calories" is not an
+/// action. [have]/[need] are added when the input is countable and merely short
+/// (beats, minutes), so the copy can say how short.
+///
+/// Deliberately NOT `need_baseline:` — `needMessageFromNote` turns that one into
+/// "Need N more nights", which is a lie about a missing profile field or a thin
+/// beat series. A key it does not recognise renders as "we do not know", which
+/// is the honest floor.
+String needInputNote(String name, {num? have, num? need}) =>
+    'need_input:name=$name'
+    '${have == null || need == null ? '' : ',have=$have,need=$need'}';
+
+/// The note for an absence we cannot attribute. Honest; a plausible guess is
+/// not. Anything that renders a reason must be able to reach this.
+const String kUnknownAbsenceNote = 'unknown_cause';
+
+/// Physiological cap on the readiness composite z, above which the score is a
+/// degenerate-baseline artefact rather than a real reading — so it is abstained
+/// from the HEADLINE scalar rather than persisted.
+///
+/// The composite maps its weighted, sign-oriented z to a 0–100 score via a
+/// logistic (`readiness_composite.dart`): `score = 100 / (1 + exp(-z))`. That
+/// curve only approaches the 100 rail as z → ∞: a real composite z is a weighted
+/// mean of per-input robust-z's, so even a flawless morning (every input at +2 z)
+/// lands at z=2 → score 88, and +3 z all-round is z=3 → 95. Reaching z=5
+/// (score 99.3) is physiologically unreachable by a genuine reading — it only
+/// happens when an input's robust-z explodes because its baseline MAD is tiny.
+///
+/// robustZ (`util.dart`) returns null only on EXACT-zero MAD (fully-quantised
+/// baseline) → the composite abstains and the ring shows a blank '—'. But a
+/// baseline that is near-degenerate — e.g. duplicate-day pollution collapsing the
+/// window toward one repeated value — has a tiny NON-zero MAD, so robustZ does
+/// NOT null: it returns a huge z, the logistic saturates, and the headline flashes
+/// ~100 before a cleaner re-derive snaps it back (the ready→ready bounce, #117).
+/// Capping at 5 suppresses ONLY that saturated rail and hides zero legitimate
+/// scores. This is the belt-and-braces guard; removing the degenerate baselines at
+/// source is the sibling `fix/readiness-baseline-pollution` work.
+const double kReadinessZCap = 5.0;
+
+/// Nights of personal baseline behind an EARLY readiness estimate, shown while
+/// the full composite (analytics' 14) is still cold-starting. Four is the
+/// shortest window the person chose to see a number from; the composite's own
+/// refusals (quantized dispersion, min inputs/weight) and [kReadinessZCap]
+/// still apply, so a degenerate baseline is refused, not scored.
+const int kReadinessEarlyMinBaseline = 4;
+
+/// ROUGH GUIDE — nights 1–4, before there is any personal baseline at all.
+///
+/// The person asked for a number from the first night, WHOOP-style, knowing it
+/// rests on population averages rather than on them. These are APPROXIMATE
+/// adult reference values for the two inputs whose norms transfer between
+/// devices — the lowest-30-minute sleeping heart rate and the sleeping
+/// breathing rate — with deliberately wide spreads. HRV is left out: wrist HRV
+/// norms depend on the device and method, so a population value would be a
+/// guess about this band, not about the person. Labelled "Rough guide" in the
+/// UI, never written to the readiness series, and superseded by the early
+/// estimate as soon as four of the person's own nights exist. This is the ONE
+/// documented exception to the no-substituted-defaults rule (AGENTS.md §3.3).
+const double kRoughRhrMean = 58, kRoughRhrSd = 8; // bpm, sleeping low-30 min
+const double kRoughRespMean = 14.5, kRoughRespSd = 2; // breaths/min asleep
+
+/// The rough-guide score from tonight's sleeping RHR and breathing rate, or
+/// null without BOTH (two inputs is the composite's own floor). Same weights
+/// (RHR 0.30, RR 0.20, renormalised), same lower-is-better orientation, same
+/// logistic map and z-cap as [readinessComposite].
+double? roughReadinessScalar(double? rhr, double? resp) {
+  if (rhr == null || resp == null) return null;
+  final zRhr = -(rhr - kRoughRhrMean) / kRoughRhrSd;
+  final zResp = -(resp - kRoughRespMean) / kRoughRespSd;
+  final z = (0.30 * zRhr + 0.20 * zResp) / 0.50;
+  if (z.abs() > kReadinessZCap) return null;
+  return 100 / (1 + math.exp(-z));
+}
+
+/// The early estimate for [full], or null. Only while [full] is cold-starting
+/// (its need_baseline note); then the same composite over the same [inputs]
+/// with the shorter baseline, through the same z-cap. Pure, for the tests.
+double? earlyReadinessScalar(
+    Metric<Readiness> full, List<ReadinessInput> inputs) {
+  if (full.present || !(full.note?.startsWith('need_baseline') ?? false)) {
+    return null;
+  }
+  return headlineReadinessScalar(
+      readinessComposite(inputs, minBaseline: kReadinessEarlyMinBaseline));
+}
+
+/// The headline readiness scalar for a computed [composite], or null when it must
+/// abstain: absent composite, or one whose |z| exceeds [kReadinessZCap] (a
+/// saturated, degenerate-baseline artefact — see [kReadinessZCap]). Pure so the
+/// gate is unit-testable without the full pipeline.
+double? headlineReadinessScalar(Metric<Readiness> composite) {
+  if (!composite.present) return null;
+  final r = composite.value!;
+  if (r.compositeZ.abs() > kReadinessZCap) return null;
+  return r.score;
+}
+
+/// The `readiness_absent_diag` note for a composite that computed (unlike the
+/// `!composite.present` cold-start case) but got withheld by [kReadinessZCap]
+/// — a saturated, degenerate-baseline artefact. Null whenever
+/// [headlineReadinessScalar] would have returned a value, i.e. there is
+/// nothing to explain.
+///
+/// Deliberately NOT the `need_baseline:` note (edge#305): reaching a present
+/// composite already means every input cleared `readinessCompositeMinBaseline`,
+/// so "Need N more nights" would be a proven-false cause once this fires — the
+/// UI's baseline-note convention exists precisely to prevent stating a wrong
+/// cause. Pure so the gate + note format are unit-testable without the full
+/// pipeline.
+String? zCapAbsentNote(Metric<Readiness> composite) {
+  if (!composite.present) return null;
+  if (headlineReadinessScalar(composite) != null) return null;
+  final z = composite.value!.compositeZ;
+  return 'unstable_baseline:z=${z.toStringAsFixed(3)},cap=$kReadinessZCap';
+}
+
+/// Serializable input to the isolate: one physiological day's decoded 1 Hz
+/// substrate (the day slice), the PRECOMPUTED single-source sleep segmentation,
+/// the profile, and trailing baseline history for the readiness pass.
+///
+/// `*Win` arrays are the day-slice arrays restricted to the SLEEP window — the
+/// coordinator slices once so the isolate input is small and the windowing is
+/// done in exactly one place. `sleepJson` is the SleepSegmentation.toJson() (the
+/// single source of TST/WASO/stages/hypnogram).
+class DayBundleInput {
+  final String date; // wake-to-wake label (coordinator-supplied)
+
+  // ── DAY span (wake → next wake) 1 Hz substrate ────────────────────────────
+  final List<int> dayTsSec;
+  final List<int> dayHr; // 0 = off-skin
+
+  /// The band's own per-second activity class over [dayTsSec] (−1 absent,
+  /// 0 still, ≥1 moving), parallel to [dayHr]; empty when not carried. Stress
+  /// uses it to leave out the minutes a raised heart rate is just movement.
+  final List<int> dayActivityClass;
+  // Day-span RR (beat-end epoch ms + interval ms) for the 24/7 irregular-rhythm
+  // screen. Sparse (0–4 beats/s); empty when no RR was captured.
+  final List<double> dayRrTsMs;
+  final List<double> dayRrMs;
+
+  // ── SLEEP window 1 Hz substrate (the window from segmentSleep) ────────────
+  final List<int> sleepTsSec;
+  final List<int> sleepHr;
+  final List<double> sleepRrTsMs;
+  final List<double> sleepRrMs;
+  final List<int> sleepSkinTemp;
+
+  // ── the SINGLE-SOURCE sleep segmentation (JSON of SleepSegmentation) ──────
+  final Map<String, dynamic> sleepJson; // {window,tst_sec,…,confidence}
+  final List<String> hypnoStages; // per-second 'wake'|'nrem'|'rem' over window
+  final int sleepOnsetSec; // window onset (epoch sec), 0 if no sleep
+  final int sleepOffsetSec; // window offset (epoch sec), 0 if no sleep
+
+  // ── profile + trailing baseline history ───────────────────────────────────
+  final Map<String, dynamic> profile;
+  final List<double> lnRmssdHistory;
+  final List<double> rhrHistory;
+  final List<double> respHistory;
+
+  /// Trailing robust nocturnal RMSSD means (ms) — the SAME `rmssd` series the
+  /// engine writes to metric_series (NREM-restricted, median-of-5-min). Used as
+  /// the history for the EWMA hrv baseline so its center and today's value are the
+  /// SAME metric (was previously reconstructed from ln(whole-window RMSSD), a
+  /// definition mismatch that made the z spuriously large).
+  final List<double> rmssdHistory;
+
+  /// Trailing RAW nightly skin-temp ADC means (NOT z-scores). The personal
+  /// baseline for the relative skin-temp deviation: today's mean sleep-window
+  /// ADC is z-scored against THIS series. Must be raw ADC means so the unit
+  /// matches today's raw mean (the old z-vs-z series was a unit mismatch bug).
+  final List<double> skinTempAdcHistory;
+
+  /// Trailing per-day quiet-waking HRR (`quiet_hrr` series), oldest first —
+  /// the level strain subtracts, as this person's median (quiet_level.dart).
+  final List<double> quietHrrHistory;
+
+  /// Last night's sleep need (min) and sleep consistency (0–100), as the
+  /// cross-day pass stored them the day before, and the trailing sleep
+  /// performance series — the inputs of the WHOOP-matched recovery
+  /// (whoop_calibration.dart). Null / empty until that pass has run.
+  final double? prevSleepNeedMin;
+  final double? prevSleepConsistency;
+  final List<double> sleepPerfHistory;
+
+  /// TS-03 — the highest heart rate the band has OBSERVED (held >=15 s with
+  /// corroborating motion, `observed_max_hr.dart`) on any day STRICTLY BEFORE
+  /// this one, or null when there is none. Not a physiological HRmax: if the
+  /// user has never gone truly hard it is an underestimate and it keeps
+  /// creeping up.
+  ///
+  /// Strictly-before, like every other history here and for the same reason —
+  /// a day must not be banded on a ceiling its own record-setting session set,
+  /// or the derived output depends on nothing but itself.
+  final double? observedHrCeilingBpm;
+
+  // ── day confidence + flags (e.g. LOW_CONFIDENCE_RECOVERY for fallback days) ─
+  final double dayConfidence;
+  final List<String> dayFlags;
+
+  /// The day's resolved `live_coverage` spans as `[startSec, endSec, steps]`
+  /// — credited, never raw rows (band/phone overlap already settled). The
+  /// energy mirror prices sub-flex-gate walking minutes off these, through
+  /// the SAME `cadenceSpmForMinutes` mapping the coordinator's canonical
+  /// `wakeDayEnergy` pass uses, so the early read and the derived day bill
+  /// the same walk the same way. Empty when nothing measured steps.
+  final List<List<int>> stepSpans;
+
+  /// Which strap measured this day — `'gen4'`, `'gen5'`, or null for UNKNOWN
+  /// (unstamped historical rows, imports, the raw-hex replay path). Null is its
+  /// own case, never gen4: see [Substrate.deviceFamily] and analytics'
+  /// device.dart. Per-family figures (the HR ceiling, and everything banded on
+  /// it) REFUSE rather than borrow another family's constants.
+  final String? deviceFamily;
+
+  /// How the sleep window was chosen: `'manual'`/`'confirmed'` (the user's own
+  /// word), `'auto'`, `'auto_fallback'`, `'none'`. Sleep-onset latency is only
+  /// meaningful on a FORCED window — see `sol_sec` below.
+  final String sleepSource;
+
+  const DayBundleInput({
+    required this.date,
+    required this.dayTsSec,
+    required this.dayHr,
+    this.dayActivityClass = const [],
+    this.dayRrTsMs = const [],
+    this.dayRrMs = const [],
+    required this.sleepTsSec,
+    required this.sleepHr,
+    required this.sleepRrTsMs,
+    required this.sleepRrMs,
+    required this.sleepSkinTemp,
+    required this.sleepJson,
+    required this.hypnoStages,
+    required this.sleepOnsetSec,
+    required this.sleepOffsetSec,
+    required this.profile,
+    this.lnRmssdHistory = const [],
+    this.rhrHistory = const [],
+    this.respHistory = const [],
+    this.rmssdHistory = const [],
+    this.skinTempAdcHistory = const [],
+    this.quietHrrHistory = const [],
+    this.prevSleepNeedMin,
+    this.prevSleepConsistency,
+    this.sleepPerfHistory = const [],
+    this.observedHrCeilingBpm,
+    this.dayConfidence = 0,
+    this.dayFlags = const [],
+    this.deviceFamily,
+    this.sleepSource = 'auto',
+    this.stepSpans = const [],
+  });
+
+  Map<String, dynamic> toJson() => {
+    'date': date,
+    'step_spans': stepSpans,
+    // Zero-copy: emit typed lists (Float64List/Int32List/Uint8List) instead of plain Lists.
+    // These cross the isolate boundary without JSON re-boxing; fromJson() handles both.
+    'day_ts': Int32List.fromList(dayTsSec),
+    'day_hr': Int32List.fromList(dayHr),
+    'day_activity_class': dayActivityClass.isNotEmpty
+        ? Int32List.fromList(dayActivityClass)
+        : Int32List(0),
+    'day_rr_ts_ms': dayRrTsMs.isNotEmpty
+        ? Float64List.fromList(dayRrTsMs)
+        : Float64List(0),
+    'day_rr_ms': dayRrMs.isNotEmpty
+        ? Float64List.fromList(dayRrMs)
+        : Float64List(0),
+    'sleep_ts': Int32List.fromList(sleepTsSec),
+    'sleep_hr': Int32List.fromList(sleepHr),
+    'sleep_rr_ts_ms': sleepRrTsMs.isNotEmpty
+        ? Float64List.fromList(sleepRrTsMs)
+        : Float64List(0),
+    'sleep_rr_ms': sleepRrMs.isNotEmpty
+        ? Float64List.fromList(sleepRrMs)
+        : Float64List(0),
+    'sleep_skin_temp': Int32List.fromList(sleepSkinTemp),
+    'sleep_json': sleepJson,
+    // hypnoStages: Uint8List (0=wake, 1=nrem, 2=rem) instead of List<String>
+    'hypno_stages': _encodeHypnoStages(hypnoStages),
+    'sleep_onset_sec': sleepOnsetSec,
+    'sleep_offset_sec': sleepOffsetSec,
+    'profile': profile,
+    'ln_rmssd_history': lnRmssdHistory.isNotEmpty
+        ? Float64List.fromList(lnRmssdHistory)
+        : Float64List(0),
+    'rhr_history': rhrHistory.isNotEmpty
+        ? Float64List.fromList(rhrHistory)
+        : Float64List(0),
+    'resp_history': respHistory.isNotEmpty
+        ? Float64List.fromList(respHistory)
+        : Float64List(0),
+    'rmssd_history': rmssdHistory.isNotEmpty
+        ? Float64List.fromList(rmssdHistory)
+        : Float64List(0),
+    'skin_temp_adc_history': skinTempAdcHistory.isNotEmpty
+        ? Float64List.fromList(skinTempAdcHistory)
+        : Float64List(0),
+    'quiet_hrr_history': quietHrrHistory.isNotEmpty
+        ? Float64List.fromList(quietHrrHistory)
+        : Float64List(0),
+    'prev_sleep_need_min': prevSleepNeedMin,
+    'prev_sleep_consistency': prevSleepConsistency,
+    'sleep_perf_history': sleepPerfHistory.isNotEmpty
+        ? Float64List.fromList(sleepPerfHistory)
+        : Float64List(0),
+    'observed_hr_ceiling_bpm': observedHrCeilingBpm,
+    'day_confidence': dayConfidence,
+    'day_flags': dayFlags,
+    'device_family': deviceFamily,
+    'sleep_source': sleepSource,
+  };
+
+  /// Encode hypno stages as Uint8List: 0=wake, 1=nrem, 2=rem.
+  /// Handles legacy 'nrem' label (maps to 1) for backward compat.
+  Uint8List _encodeHypnoStages(List<String> stages) {
+    final out = Uint8List(stages.length);
+    for (var i = 0; i < stages.length; i++) {
+      final s = stages[i];
+      if (s == 'wake') {
+        out[i] = 0;
+      } else if (s == 'nrem' || s == 'light' || s == 'deep') {
+        out[i] = 1;
+      } else if (s == 'rem') {
+        out[i] = 2;
+      } else {
+        out[i] = 0; // unobserved/unknown → wake (safe default)
+      }
+    }
+    return out;
+  }
+
+  static DayBundleInput fromJson(Map<String, dynamic> m) {
+    // Zero-copy: handle typed lists (Float64List, Int32List, Uint8List) directly.
+    // Falls back to plain List parsing for backward compatibility with old bundles.
+    List<int> ints(String k) {
+      final v = (m[k] as List?) ?? const [];
+      if (v is Int32List) return v.toList();
+      return v.map((e) => (e as num).toInt()).toList();
+    }
+    List<double> dbls(String k) {
+      final v = (m[k] as List?) ?? const [];
+      if (v is Float64List) return v.toList();
+      final out = Float64List(v.length);
+      for (var i = 0; i < v.length; i++) {
+        out[i] = (v[i] as num).toDouble();
+      }
+      return out.toList();
+    }
+    List<String> strs(String k) =>
+        ((m[k] as List?) ?? const []).map((e) => e.toString()).toList();
+    List<String> hypno(String k) => _decodeHypnoStages(m[k]);
+    return DayBundleInput(
+      date: m['date'] as String,
+      dayTsSec: ints('day_ts'),
+      dayHr: ints('day_hr'),
+      dayActivityClass: ints('day_activity_class'),
+      dayRrTsMs: dbls('day_rr_ts_ms'),
+      dayRrMs: dbls('day_rr_ms'),
+      sleepTsSec: ints('sleep_ts'),
+      sleepHr: ints('sleep_hr'),
+      sleepRrTsMs: dbls('sleep_rr_ts_ms'),
+      sleepRrMs: dbls('sleep_rr_ms'),
+      sleepSkinTemp: ints('sleep_skin_temp'),
+      sleepJson: ((m['sleep_json'] as Map?) ?? const {})
+          .cast<String, dynamic>(),
+      hypnoStages: hypno('hypno_stages'),
+      sleepOnsetSec: (m['sleep_onset_sec'] as num?)?.toInt() ?? 0,
+      sleepOffsetSec: (m['sleep_offset_sec'] as num?)?.toInt() ?? 0,
+      profile: ((m['profile'] as Map?) ?? const {}).cast<String, dynamic>(),
+      lnRmssdHistory: dbls('ln_rmssd_history'),
+      rhrHistory: dbls('rhr_history'),
+      respHistory: dbls('resp_history'),
+      rmssdHistory: dbls('rmssd_history'),
+      skinTempAdcHistory: dbls('skin_temp_adc_history'),
+      quietHrrHistory: dbls('quiet_hrr_history'),
+      prevSleepNeedMin: (m['prev_sleep_need_min'] as num?)?.toDouble(),
+      prevSleepConsistency: (m['prev_sleep_consistency'] as num?)?.toDouble(),
+      sleepPerfHistory: dbls('sleep_perf_history'),
+      observedHrCeilingBpm: (m['observed_hr_ceiling_bpm'] as num?)?.toDouble(),
+      dayConfidence: (m['day_confidence'] as num?)?.toDouble() ?? 0,
+      dayFlags: strs('day_flags'),
+      deviceFamily: m['device_family'] as String?,
+      sleepSource: m['sleep_source'] as String? ?? 'auto',
+      stepSpans: [
+        for (final r in (m['step_spans'] as List? ?? const []))
+          [for (final v in (r as List)) (v as num).toInt()],
+      ],
+    );
+  }
+
+  /// Decode hypno stages from Uint8List (0=wake, 1=nrem, 2=rem) or legacy List<String>.
+  static List<String> _decodeHypnoStages(dynamic v) {
+    if (v == null) return const [];
+    if (v is Uint8List) {
+      final out = <String>[];
+      for (var i = 0; i < v.length; i++) {
+        switch (v[i]) {
+          case 0:
+            out.add('wake');
+            break;
+          case 1:
+            out.add('nrem');
+            break;
+          case 2:
+            out.add('rem');
+            break;
+          default:
+            out.add('wake');
+        }
+      }
+      return out;
+    }
+    // Legacy: List<String>
+    return ((v as List?) ?? const []).map((e) => e.toString()).toList();
+  }
+}
+
+/// THE ISOLATE ENTRY POINT.
+///
+/// Pure: takes the serialized [DayBundleInput] map, returns a plain JSON map (the
+/// full derived bundle). Call directly + synchronously in tests, or via
+/// `Isolate.run(() => deriveDayBundle(input))` in production.
+Map<String, dynamic> deriveDayBundle(Map<String, dynamic> inputJson) {
+  final d = DayBundleInput.fromJson(inputJson);
+
+  // ── HR over the DAY (for the curve, strain zones, dip day-side) ───────────
+  final dayHr = [for (final h in d.dayHr) h.toDouble()];
+  final dayHrValid = dayHr.where((h) => h > 0).toList();
+
+  // ── WORN minutes — distinct wall-clock minutes that have ANY record ────────
+  // Wear is RECORD presence, NOT valid HR. The band logs 1 Hz to flash only
+  // while on-wrist (off-wrist it stops and emits WRIST_OFF), so a record in a
+  // minute means the band was worn that minute. We deliberately do NOT gate on
+  // HR>0: a valid HR needs a still wrist + good optical contact, which happens
+  // mostly during SLEEP, so an HR-valid count collapses "worn" to ~the sleep
+  // duration (the 24 h-worn-shows-7 h bug). Bucketing by real epoch-second
+  // timestamp (not array index) is also gap-safe.
+  final wornMinuteBuckets = <int>{};
+  for (final ts in d.dayTsSec) {
+    wornMinuteBuckets.add(ts ~/ 60);
+  }
+  final wornMin = wornMinuteBuckets.length;
+
+  // ── HR over the SLEEP WINDOW (RHR / dip night-side) ────────────────────────
+  // Impossible readings (below kHrFloorBpm, above the age ceiling) are off-skin
+  // glitches, not heart rates: they read as 0 — invalid — so a burst of 230s
+  // cannot lift the night's resting HR and drop readiness with it.
+  final sleepCeil = hrCeilingForAge((d.profile['age'] as num?)?.round());
+  final sleepHr = [
+    for (final h in d.sleepHr)
+      h >= kHrFloorBpm && h <= sleepCeil ? h.toDouble() : 0.0,
+  ];
+  // The clock for that series — parallel by construction (both are `Substrate`
+  // columns, 1:1 with `tsSec`). Seconds as doubles because that is what the
+  // analytics window helpers take.
+  final sleepTs = [for (final t in d.sleepTsSec) t.toDouble()];
+
+  // ── RR over the SLEEP WINDOW → cleaned NN → HRV (the V2 fix) ───────────────
+  // HRV/RHR are rest/sleep-only per the catalog. Running correctRr+hrvTime over
+  // the SLEEP RR (not the whole day) is what brings RMSSD back to physiological
+  // tens-of-ms instead of the whole-day ~166 ms inflated value.
+  final corrected = correctRr(d.sleepRrMs, rrTsMs: d.sleepRrTsMs);
+  final nn = corrected.nn;
+  final nnTimes = corrected.nnTimesMs;
+  final artifactFraction = (1.0 - corrected.cleanFraction).clamp(0.0, 1.0);
+
+  final hasSleep = (d.sleepJson['tst_sec']) != null;
+
+  // ── SLEEP: everything from the SINGLE-SOURCE segmentation ──────────────────
+  final sleepWinJson = (d.sleepJson['window'] as Map?)?.cast<String, dynamic>();
+  final tstSec = (d.sleepJson['tst_sec'] as num?)?.toInt();
+  final wasoSec = (d.sleepJson['waso_sec'] as num?)?.toInt();
+  final inBedSec = (d.sleepJson['in_bed_sec'] as num?)?.toInt();
+  final effPct = (d.sleepJson['efficiency_pct'] as num?)?.toDouble();
+  final nremSec = (d.sleepJson['nrem_sec'] as num?)?.toInt();
+  // 4-class split of NREM into Light/Deep (Deep = LOW CONFIDENCE overlay).
+  final lightSec = (d.sleepJson['light_sec'] as num?)?.toInt();
+  final deepSec = (d.sleepJson['deep_sec'] as num?)?.toInt();
+  final remSec = (d.sleepJson['rem_sec'] as num?)?.toInt();
+  final wakeSec = (d.sleepJson['wake_sec'] as num?)?.toInt();
+  final sleepConf = (d.sleepJson['confidence'] as num?)?.toDouble() ?? 0;
+  // SLP-01 — `segment.dart` has always serialised both of these and edge read
+  // neither, so they died at the seam. `in_bed_sec` is WALL CLOCK and includes
+  // the hours we never watched; `efficiency_pct` already divides by OBSERVED
+  // time on purpose, so without this key the honest denominator just reads as a
+  // worse night. `absence_reason` is why a window produced nothing.
+  final unobservedSec = (d.sleepJson['unobserved_sec'] as num?)?.toInt();
+  final absenceReason = d.sleepJson['absence_reason'] as String?;
+  final runs = _sleepRuns(d);
+
+  // ── CLINICAL (sleep-windowed) ──────────────────────────────────────────────
+  // Whole-window time-domain HRV is kept for SDNN / detail rows only. The
+  // nightly headline HRV is the mean of 5-min cleaned-window RMSSDs across the
+  // detected sleep session, not one RMSSD over the whole night's NN stream.
+  final hrvT = hrvTime(nn, nnTimesMs: nnTimes);
+  // Keep the robust estimator as a secondary detail only; the canonical nightly
+  // RMSSD follows the sleep-session windowed formulation.
+  final nremMask = _nremMaskAlignedToNn(d, nnTimes, d.sleepRrTsMs);
+  final robustRmssd = nocturnalRmssd(nn, nnTimes, stageMaskPerSec: nremMask);
+  final sleepSessionRmssdMetric = sleepSessionWindowedRmssd(
+    d.sleepRrMs,
+    d.sleepRrTsMs,
+    startSec: d.sleepOnsetSec,
+    endSec: d.sleepOffsetSec,
+  );
+  // THE HEADLINE is WHOOP's formulation (night_hrv.dart): overlapping 5-min
+  // windows, wake removed, deep sleep and later night weighted up. It is only
+  // tried on a night the session estimator accepted — same cleaner, and its
+  // night-level jitter refusal still gates — and when it abstains (too few
+  // staged windows) the session mean stands, which measures the same thing.
+  final weightedRmssdMetric = sleepSessionRmssdMetric.present
+      ? weightedNightRmssd(
+          d.sleepRrMs,
+          d.sleepRrTsMs,
+          startSec: d.sleepOnsetSec,
+          endSec: d.sleepOffsetSec,
+          stages: d.hypnoStages,
+        )
+      : sleepSessionRmssdMetric;
+  final headlineRmssdMetric = weightedRmssdMetric.present
+      ? weightedRmssdMetric
+      : sleepSessionRmssdMetric;
+  // An RMSSD under [kMinRmssdMs] is a stuck beat stream — identical
+  // intervals — not a heart: no headline rather than a confident 0 ms.
+  final sleepSessionRmssd = headlineRmssdMetric.present &&
+          (headlineRmssdMetric.value ?? 0) >= kMinRmssdMs
+      ? headlineRmssdMetric.value
+      : null;
+  final hrvF = nn.length >= 20
+      ? hrvFreq(nn, nnTimes, artifactFraction: artifactFraction)
+      : Metric<HrvFreq>.absent(
+          tier: Tier.high,
+          inputs_used: const ['rr_cleaned'],
+          note: needInputNote('nn_beats', have: nn.length, need: 20),
+        );
+  // Nocturnal RHR over the SLEEP HR. NO SLEEP ⇒ NO RESTING HR.
+  //
+  // This used to fall back to the whole-day HR when no sleep was scored, and
+  // published the result as resting heart rate. On the owner's own export a
+  // 213-minute day with no scored night published 88.0 bpm for a man whose
+  // measured resting HR is 55.7–64.2; a second export published 116.7. That is
+  // the lowest 30-minute mean of a day spent AWAKE, which is not a resting
+  // heart rate at any tier — it is a different quantity wearing the label. The
+  // only honest output is absence, so the card says why instead.
+  //
+  // THE 30 MINUTES ARE NOW 30 MINUTES. `nocturnalRhr` used to slide a window of
+  // 1800 POSITIONS, which is half an hour only where every position is exactly
+  // one second — so the series had to be positionally dense at 1 Hz or "the
+  // lowest 30-minute mean" quietly became "the lowest mean over whatever 1800
+  // samples survived". It is a real condition, not a hypothetical: the owner's
+  // own export has sleep windows missing 506 seconds of 25,262, and a 15 s band
+  // publishes a measured 59.7 bpm night as 66.4.
+  //
+  // Passing `sleepTs` moves the window onto the WALL CLOCK, so density stops
+  // being a precondition: 30 min is 30 min at any cadence, off-skin gaps are
+  // still never compacted away (a window must carry `minCoverage` of the
+  // samples it SHOULD hold at the stream's own measured cadence), and a stream
+  // with no measurable cadence yields ABSENCE rather than a guess. The
+  // no-sleep-no-RHR branch above is untouched by any of that.
+  final rhr = (hasSleep && sleepHr.isNotEmpty)
+      ? nocturnalRhr(sleepHr, tsSec: sleepTs)
+      : const Metric<NocturnalRhr>.absent(
+          tier: Tier.high,
+          inputs_used: ['hr_1hz', 'sleep_window'],
+          note: 'no sleep was scored for this day — resting HR is only ever '
+              'measured over a sleep window, never over waking hours',
+        );
+  // HR dip: day-side = waking HR outside the sleep window; night-side = sleep HR.
+  final dayOnly = _dayHrOutsideSleep(d);
+  final dip = hrDip(dayOnly, sleepHr);
+  final dc = decelerationCapacity(nn);
+  final ac = accelerationCapacity(nn);
+  // Baevsky Stress Index over the sleep NN — resting autonomic tension (a
+  // transparent RR-histogram metric; no ML). Daily resting-stress indicator.
+  // nnTimesMs lets it segment at a charging/off-wrist gap instead of letting
+  // a sliding window straddle it (same gap-aware pattern as cvhrApneaScreen
+  // below).
+  final stress = baevskyStressIndex(nn, nnTimesMs: nnTimes);
+
+  // ── RESPIRATION (sleep-windowed) ───────────────────────────────────────────
+  final resp = nn.length >= 30
+      ? rsaRespRate(nn, nnTimes, artifactFraction: artifactFraction)
+      : Metric<RespEstimate>.absent(
+          tier: Tier.estimate,
+          inputs_used: const ['rr_cleaned'],
+          note: needInputNote('nn_beats', have: nn.length, need: 30),
+        );
+  final cvhr = nn.length >= 60
+      ? cvhrApneaScreen(nn, nnTimes, artifactFraction: artifactFraction)
+      : Metric<CvhrResult>.absent(
+          tier: Tier.estimate,
+          inputs_used: const ['rr_cleaned'],
+          note: needInputNote('nn_beats', have: nn.length, need: 60),
+        );
+  // ── 24/7 IRREGULAR-RHYTHM SCREEN (day-span RR; not a diagnosis) ────────────
+  // Runs over the WHOLE-DAY cleaned RR (not just sleep) so an arrhythmia screen
+  // isn't limited to the sleep window. Hard-gated on beat count + artifact inside
+  // irregularBeatScreen; returns absent on a thin/noisy day.
+  final dayCorrected = correctRr(d.dayRrMs,
+      rrTsMs: d.dayRrTsMs.isEmpty ? null : d.dayRrTsMs);
+  final irregular24h = irregularBeatScreen(
+    dayCorrected.nn,
+    // Require sustained irregularity in independent short windows, not just
+    // in one ratio blended across sleep+rest+exercise+posture changes — see
+    // irregularBeatScreen's doc. Without this, real data showed the screen
+    // firing on effectively every day regardless of actual cardiac health.
+    nnTimesMs: dayCorrected.nnTimesMs,
+    artifactFraction: (1.0 - dayCorrected.cleanFraction).clamp(0.0, 1.0),
+  );
+
+  // ── BREATHING-RATE VARIABILITY (per-window RSA over the sleep NN) ──────────
+  // Window the cleaned sleep NN into ~30-min bins, take each bin's RSA resp rate,
+  // then BRV = dispersion + Theil-Sen trend of those per-window rates.
+  final respWindows = _respPerWindow(nn, nnTimes);
+  final brv = respWindows.length >= 3
+      ? breathingRateVariability(respWindows)
+      : Metric<BrvResult>.absent(
+          tier: Tier.estimate,
+          inputs_used: const ['resp_rate_series'],
+          note: needInputNote(
+            'resp_windows',
+            have: respWindows.length,
+            need: 3,
+          ),
+        );
+
+  // SpO2 is refused PERMANENTLY, not parked. `spo2RedRaw` and `spo2IrRaw` are
+  // one signal: `ir - red` is a fixed integer within a capture session (see
+  // protocol/records.dart — constant across 178 of 300 hours of a real export)
+  // while both drift together. Any ratio, or ratio-of-ratios, built from them
+  // is a function of one channel's baseline drift and measures that drift, not
+  // oxygenation. No firmware capture and no packet work changes that; it is a
+  // property of the bytes. The raw channels stay in the substrate because they
+  // ARE the bytes at those offsets.
+  const kSpo2Refusal = 'refused: the red and IR channels are one signal — '
+      'ir − red is a fixed offset within a session, so any ratio built from '
+      'them measures baseline drift, not oxygenation';
+  const odi = Metric<RelativeOdiResult>.absent(
+    tier: Tier.relative,
+    inputs_used: ['spo2_red_raw', 'spo2_ir_raw'],
+    note: kSpo2Refusal,
+  );
+
+  // ── WELLNESS: relative skin-temp deviation (z) vs personal baseline ────────
+  // STEP 1 — today's RAW mean sleep-window skin-temp ADC. ALWAYS computable when
+  // there's sleep + temp data; stored EVERY day to build the baseline series so
+  // z starts computing once ≥3 prior days exist (honest bootstrap: first ~3 days
+  // legitimately read "—", then it works).
+  final tempValid = d.sleepSkinTemp
+      .where((v) => v > 0)
+      .map((v) => v.toDouble())
+      .toList();
+  final double? skinTempAdc = tempValid.length >= 60 ? _meanWelford(tempValid) : null;
+  // WH-11a — how much of the night that mean is actually made of. The gate above
+  // is sixty 1 Hz samples, i.e. one minute; on real hardware the temp channel
+  // runs 35-90 samples/hour, so a "last night" skin temperature can be ~1.5% of
+  // the window and nothing said so. NO THRESHOLD IS APPLIED and none should be
+  // guessed here — emit the number, look at what it reads on real nights first.
+  final double? skinTempCoverage = (inBedSec == null || inBedSec <= 0)
+      ? null
+      : (tempValid.length / inBedSec).clamp(0.0, 1.0);
+  // HOW MUCH OF THE NIGHT THE STRAP SPENT AT SKIN TEMPERATURE (#250).
+  //
+  // `tempInput` refuses readiness's temp driver outright when this is null, and
+  // nothing in this app has ever passed it — so the documented FOURTH DRIVER
+  // has never contributed on any night, the other three renormalised over 0.90,
+  // and "Skin temperature" could not appear in a breakdown. This is the number
+  // it wants: the share of the night's valid samples sitting within the
+  // family's settle band of the night's OWN median (warm-up and off-body read
+  // low; a fever reads high and passes through).
+  //
+  // MEASURED HERE, GATED IN `tempInput` — hence `minSettledFraction: 0`.
+  // `nightlySkinTemp` would otherwise go absent on an unsettled night and the
+  // fraction would be lost, which lands on the "nobody measured it" refusal
+  // instead of the true "the strap was cold for two hours" one. It still goes
+  // absent for a family whose settle band nobody has measured (gen5 has none)
+  // and for a night under sixty samples, and those genuinely ARE "no fraction
+  // measured".
+  //
+  // Ts is not read by `nightlySkinTemp` (it is a median + a mean over the
+  // night's samples), and `tempValid` has no parallel timestamp series, so 0
+  // is passed rather than a fabricated clock.
+  final settledTemp = nightlySkinTemp(
+    [for (final v in tempValid) AdcSample(0, v)],
+    deviceFamily: d.deviceFamily,
+    minSettledFraction: 0.0,
+  );
+  final double? skinTempSettledFrac = settledTemp.value?.settledFraction;
+  // STEP 2 — z-score today's RAW mean against the RAW-ADC baseline history (NOT
+  // the previously-computed z-scores; that unit mismatch was the bug). Gated on
+  // ≥3 prior raw means.
+  double? skinTempZ;
+  if (skinTempAdc != null && d.skinTempAdcHistory.length >= 3) {
+    final base = _meanWelford(d.skinTempAdcHistory)!;
+    final sd = _stddevWelford(d.skinTempAdcHistory);
+    // Quantum floor matches analytics' tempInput(quantum: 1) guard
+    // (readiness_composite.dart) for this same raw-ADC channel: a baseline
+    // oscillating between two adjacent ADC counts has a nonzero but
+    // sub-quantum SD, which standardizes ordinary quantization noise into
+    // an inflated z. Below 1 ADC count of dispersion, abstain instead.
+    if (sd != null && sd >= 1) skinTempZ = (skinTempAdc - base) / sd;
+  }
+  // WHOOP states skin temperature as degrees off the person's normal. Only a
+  // gen5 strap gives real degrees (centi-°C in this column); a gen4 one gives
+  // ADC counts with no honest conversion, so it keeps the z alone. The range
+  // check refuses a baseline that mixes in anything that is not a skin
+  // temperature in centi-°C (an ADC night from another strap).
+  double? skinTempDeltaC;
+  if (skinTempZ != null &&
+      d.deviceFamily == 'gen5' &&
+      d.skinTempAdcHistory.every((v) => v >= 2000 && v <= 4500)) {
+    skinTempDeltaC =
+        (skinTempAdc! - _meanWelford(d.skinTempAdcHistory)!) / 100;
+  }
+
+  // ── READINESS (the canonical composite, baseline-dependent) ───────────────
+  final lnToday = (sleepSessionRmssd != null && sleepSessionRmssd > 0)
+      ? math.log(sleepSessionRmssd)
+      : null;
+  // Readiness's RHR input must come from an ACTUAL detected sleep session —
+  // feeding a daytime number into readiness let a handful of minutes of live HR
+  // masquerade as an overnight resting rate, the sole reason a same-day score
+  // of 100 could appear ~10 minutes after first wearing the strap. That gate
+  // used to live HERE, on top of a `rhr` that fell back to daytime; it now
+  // lives in `rhr` itself, so this is the same number the card shows.
+  final rhrToday = rhr.present ? rhr.value!.low30Mean : null;
+  final respToday = resp.present ? resp.value!.brpm : null;
+  final readinessInputs = [
+    hrvInput(lnToday, d.lnRmssdHistory),
+    rhrInput(rhrToday, d.rhrHistory),
+    respInput(respToday, d.respHistory),
+    // Feed the RAW ADC mean + the RAW-ADC baseline so the composite computes its
+    // own oriented robust-z internally (consistent with the other inputs, which
+    // pass raw values + their raw baselines).
+    //
+    // The mean stays RAW — value and baseline have to be the same quantity, and
+    // the stored history is a series of raw nightly means. The settled fraction
+    // is the GATE on using it at all: below 0.80 the driver is refused for this
+    // night, by name, and readiness renormalises over the three that are left.
+    tempInput(
+      skinTempAdc,
+      d.skinTempAdcHistory,
+      settledFraction: skinTempSettledFrac,
+    ),
+  ];
+  final composite = readinessComposite(readinessInputs);
+  // WHOOP-MATCHED RECOVERY (whoop_calibration.dart, the owner's choice): on a
+  // night the composite was allowed to score — every baseline and z-cap gate
+  // above still decides THAT — the published number is WHOOP's combination,
+  // which weighs last night's sleep performance as heavily as HRV. Without
+  // last night's sleep performance, the composite stands as before.
+  final perfNight = calibratedSleepPerformance(
+      tstSec == null ? null : tstSec / 60, d.prevSleepNeedMin, d.prevSleepConsistency);
+  final compositeScalar = headlineReadinessScalar(composite);
+  // One computation for the full score AND the early estimate (same inputs,
+  // same histories), kept with its parts so the Recovery screen explains the
+  // very arithmetic that made the number.
+  final calParts = calibratedRecoveryParts(
+    hrvLn: lnToday,
+    hrvLnHistory: d.lnRmssdHistory,
+    rhr: rhrToday,
+    rhrHistory: d.rhrHistory,
+    resp: respToday,
+    respHistory: d.respHistory,
+    sleepPerf: perfNight,
+    sleepPerfHistory: d.sleepPerfHistory,
+  );
+  final recoveryWhoop = compositeScalar == null ? null : calParts?.score;
+  // EARLY ESTIMATE — the same composite, the same inputs, the same refusals,
+  // over a shorter personal baseline ([kReadinessEarlyMinBaseline] nights).
+  // Only while the full one is still COLD-STARTING (its note is the
+  // need_baseline one); a full composite that abstained for any other reason
+  // has a reason, and an early number must not paper over it. Kept under its
+  // own key and NEVER written to the `readiness` series: the 28-day baseline,
+  // streaks, alerts and exports read that series, and a calibrating number
+  // in it would be a fabricated history. The UI labels it "Early estimate".
+  //
+  // THE SAME FORMULA AS THE FULL SCORE. The early composite only decides THAT
+  // an early number may be shown; its value is the WHOOP-matched recovery over
+  // the same short histories. Otherwise the composite's logistic (centred on
+  // 50) handed over to the calibrated formula on night 15, and an ordinary
+  // night jumped (43 points in the scenario bench) for no physiological reason.
+  final readinessEarlyComposite =
+      earlyReadinessScalar(composite, readinessInputs);
+  final readinessEarlyScalar = readinessEarlyComposite == null
+      ? null
+      : (calParts?.score ?? readinessEarlyComposite);
+  // The parts behind whichever WHOOP-matched number is published, else none.
+  final shownParts = (recoveryWhoop != null ||
+          (readinessEarlyComposite != null && calParts != null))
+      ? calParts
+      : null;
+  // Rough guide: only while cold-starting AND before the early estimate can
+  // exist (fewer than kReadinessEarlyMinBaseline nights of history).
+  final readinessRoughScalar = !composite.present &&
+          readinessEarlyScalar == null &&
+          (composite.note?.startsWith('need_baseline') ?? false) &&
+          d.rhrHistory.length < kReadinessEarlyMinBaseline
+      ? roughReadinessScalar(rhrToday, respToday)
+      : null;
+  // Populated when readiness comes back absent, so the main isolate can log WHY
+  // instead of a bare null (this runs inside Isolate.run, so it can't call
+  // Firebase directly; it just returns data). TWO consumers now, and the second
+  // is why the shape below is what it is: `readiness_detail.dart` renders these
+  // rows TO THE USER — "Measured · 6 nights of your own history" — so every key
+  // here is either something a person is owed or something a crash report needs.
+  //
+  // `baseline_sd` USED TO BE HERE and is gone. It existed to identify a
+  // degenerate-dispersion baseline BY ELIMINATION, back when readinessComposite
+  // abstained on that silently. It no longer does: the quantized inputs (RHR,
+  // temp) refuse by name with the number in the note —
+  // `baseline_dispersion_below_quantum:sd=…,quantum=…,n=…`. The two continuous
+  // inputs (lnRMSSD, resp) have no quantum and so still fall through to the
+  // mean/SD z, which only returns null on an EXACTLY constant baseline of
+  // doubles — a case that cannot be reached by real nightly values. So the
+  // field diagnosed nothing the note does not say, and shipped an unexplained
+  // number to a Crashlytics field that had to be read by someone who knew all
+  // of the above.
+  Map<String, dynamic>? readinessAbsentDiag;
+  if (!composite.present) {
+    readinessAbsentDiag = {
+      'hrv': {
+        'value': lnToday != null,
+        'baseline_n': d.lnRmssdHistory.length,
+      },
+      'rhr': {
+        'value': rhrToday != null,
+        'baseline_n': d.rhrHistory.length,
+      },
+      'resp': {
+        'value': respToday != null,
+        'baseline_n': d.respHistory.length,
+      },
+      'temp': {
+        'value': skinTempAdc != null,
+        'baseline_n': d.skinTempAdcHistory.length,
+        // The gate, not the value: a temp driver can be refused with a perfectly
+        // good mean and a full baseline. Null = the fraction was unmeasurable.
+        'settled_frac': skinTempSettledFrac,
+      },
+      'note': composite.note,
+    };
+  }
+  // Plews lnRMSSD readiness. `readinessLnRmssd` is contractually handed the
+  // trailing history with TONIGHT AS THE LAST ELEMENT and takes strictly the
+  // prior elements as its baseline (analytics v38). So appending `lnToday`
+  // exactly once is right — PROVIDED `d.lnRmssdHistory` holds only days BEFORE
+  // this one. It didn't: the engine filled it from an unfiltered trailing
+  // `metric_series` window that already contained the row a previous derive of
+  // THIS day wrote, so today was in its own baseline AND counted a second time
+  // by this append. The engine now self-excludes the target date
+  // (`_attachHistory` → `_BaselineHistoryCache.valuesBefore`), which is what
+  // makes this single append the correct, non-duplicating one.
+  final lnHist = [...d.lnRmssdHistory, ?lnToday];
+  final lnReadiness = lnHist.length >= 4
+      ? readinessLnRmssd(lnHist)
+      : Metric<ReadinessLnRmssd>.absent(
+          tier: Tier.high,
+          inputs_used: const ['ln_rmssd_history'],
+          // A BASELINE shortfall, so it gets the baseline grammar the UI
+          // already turns into "Need N more nights".
+          note: needBaselineNote(have: lnHist.length, need: 4),
+        );
+
+  // ── STRAIN: Banister TRIMP over the WAKE span (per-minute day HR) ──────────
+  final prof = d.profile;
+  final age = (prof['age'] as num?)?.toDouble();
+  final sex = (prof['sex'] as String?)?.toLowerCase();
+  // ONE definition, device-dispatched (hr_max.dart). Null on an unknown strap,
+  // which takes TRIMP/strain/zones/calories with it — deliberately: we do not
+  // know what measured this HR, so we cannot say where its ceiling is.
+  final hrMax = estimatedMaxHr(age, d.deviceFamily);
+  // TS-04 — THE zone set (hr_max.dart). Karvonen %HRR between the OBSERVED
+  // ceiling and the 28-day median resting HR once both exist; %HRmax off the
+  // age estimate until then, which is exactly what this line used to do alone.
+  // `zone_source` below is what the screens print, and TRIMP/calories are
+  // deliberately NOT moved onto the observed ceiling here — that re-scores
+  // every historical strain and is its own decision.
+  final zoneSet = trainingZones(
+    age: age,
+    deviceFamily: d.deviceFamily,
+    observedCeilingBpm: d.observedHrCeilingBpm,
+    restingHrHistory: d.rhrHistory,
+    manualZoneLowerBpm: manualZoneBoundsFromProfile(prof),
+  );
+  final rhrForTrimp = rhrToday ?? (prof['resting_hr'] as num?)?.toDouble();
+  final weightKg = (prof['weight_kg'] as num?)?.toDouble();
+  final heightCm = (prof['height_cm'] as num?)?.toDouble();
+  // Wake-span per-minute mean HR = the day minus the sleep window (shared by
+  // TRIMP, HR zones, and calories so all three see the same wake series).
+  final strainCeiling = hrCeilingForAge((d.profile['age'] as num?)?.round());
+  final strainSeconds = [for (var i = 0; i < d.dayHr.length; i++)
+    if (d.dayHr[i] >= kHrFloorBpm && d.dayHr[i] <= strainCeiling &&
+        !(d.dayTsSec[i] >= d.sleepOnsetSec && d.dayTsSec[i] < d.sleepOffsetSec)) i];
+  final strainHr = [for (final i in strainSeconds) d.dayHr[i].toDouble()];
+  final wakeHr = _perMinuteWakeSeries(d);
+  final perMin = [for (final p in wakeHr) p.hr];
+  // The cost of being awake that strain subtracts: THIS person's quiet-waking
+  // level from the days before (quiet_level.dart), and today's own measured
+  // level, stored so tomorrow's median has it. Today's never scores today.
+  final quietHrr = personalQuietHrr(d.quietHrrHistory);
+  final quietToday = dailyQuietWakingHrr(perMin, restingHr: rhrForTrimp, maxHr: hrMax);
+  // ── WHY the activity family is absent, named AT THE GATE THAT CAUSED IT ────
+  //
+  // These four figures — strain/TRIMP, the zone minutes, the ceiling they were
+  // banded on, and active calories — fail on OVERLAPPING but DIFFERENT inputs,
+  // and they used to go absent with no reason at all while the reason was
+  // written onto `daytime_hrv` and `hr_ceiling`, which no screen that renders
+  // them reads. The screens then guessed, and guessed wrong ("add your age" on
+  // a profile whose age is set). Each figure now carries its own root cause, in
+  // the order the gates below actually apply, so nothing has to infer a cause
+  // from a sibling.
+  //
+  // Same order and same vocabulary as `DerivationEngine._wakeDayFeatures` —
+  // that half recomputes all of this off the nocturnal resting HR and its
+  // answer is the one that lands on the day, so the two must not disagree about
+  // WHY.
+  final ceilingAbsentNote = hrMax != null
+      ? null
+      : age == null
+      ? needInputNote('age')
+      // The age is known; what measured this HR is not, so there is no ceiling
+      // to band it against (analytics' device.dart contract).
+      : unknownFamilyNote(d.deviceFamily);
+  final strainAbsentNote = perMin.isEmpty
+      ? needInputNote('wake_hr')
+      : hrMax == null
+      ? ceilingAbsentNote
+      : dayHrValid.isEmpty
+      ? needInputNote('hr_samples')
+      : rhrForTrimp == null
+      ? needInputNote('resting_hr')
+      : sex == null
+      ? needInputNote('sex')
+      : null;
+  final caloriesAbsentNote = perMin.isEmpty
+      ? needInputNote('wake_hr')
+      : hrMax == null
+      ? ceilingAbsentNote
+      : age == null
+      ? needInputNote('age')
+      : sex == null
+      ? needInputNote('sex')
+      : weightKg == null
+      ? needInputNote('weight_kg')
+      // Keytel does not read height; `dailyEnergy`'s ACTIVE term nets out a
+      // Mifflin basal minute, which does. See the long note below.
+      : heightCm == null
+      ? needInputNote('height_cm')
+      : null;
+  final zonesAbsentNote = perMin.isEmpty
+      ? needInputNote('wake_hr')
+      : (hrMax == null || zoneSet == null)
+      ? (ceilingAbsentNote ?? kUnknownAbsenceNote)
+      : null;
+  Metric<double> trimp = Metric<double>.absent(
+    tier: Tier.estimate,
+    inputs_used: const ['hr_1hz', 'profile'],
+    note: strainAbsentNote ?? kUnknownAbsenceNote,
+  );
+  Map<String, int> hrZones = const {};
+  double? caloriesKcal;
+  if (hrMax != null && perMin.isNotEmpty) {
+    if (rhrForTrimp != null && sex != null && dayHrValid.isNotEmpty) {
+      trimp = banisterTrimp(
+        perMin,
+        restingHr: rhrForTrimp,
+        maxHr: hrMax,
+        sex: workoutSex(sex) == 'female' ? Sex.female : Sex.male,
+      );
+    }
+    if (zoneSet != null) {
+      hrZones = _wakeZoneMinutesFromSeries(wakeHr, zoneSet);
+    }
+    // ACTIVE energy only, over the WAKE series — the same quantity, from the
+    // same series, that `DerivationEngine.wakeDayEnergy` publishes as the day's
+    // `calories`. That method is canonical; this is the early-read mirror the
+    // pure pipeline can compute without the coordinator, and the two must stay
+    // on the same series AND the same gate. `basal`/`total` are deliberately
+    // not read here: the pipeline does not know how many minutes of the
+    // calendar day the substrate covers, so it cannot pro-rate the BMR floor
+    // honestly.
+    //
+    // HEIGHT IS REQUIRED, and it used to be defaulted to 170 cm. Keytel does
+    // not read height but `dailyEnergy`'s ACTIVE term is the surplus over the
+    // Mifflin basal minute, and Mifflin does — so a stand-in height moves the
+    // active figure this line publishes (about 117 kcal/day across a
+    // 150-195 cm profile). `wakeDayEnergy` abstains for that reason; so does
+    // this, or Today shows an imputed number the derived day then withdraws.
+    //
+    // The RESTING HR is required for the same class of reason: `dailyEnergy`'s
+    // active gate is a %HRR flex point, so without the lower reserve anchor
+    // there is no gate and every wake minute bills as active. `wakeDayEnergy`
+    // abstains without it; so does this, or the two drift again.
+    if (age != null &&
+        sex != null &&
+        weightKg != null &&
+        heightCm != null &&
+        rhrForTrimp != null) {
+      final cadence = d.stepSpans.isEmpty ? null : cadenceSpmForMinutes(
+          [for (final p in wakeHr) p.tsSec ~/ 60], d.stepSpans);
+      final cadenceByMinute = <int, double?>{
+        if (cadence != null)
+          for (var i = 0; i < wakeHr.length; i++) wakeHr[i].tsSec ~/ 60: cadence[i],
+      };
+      final energy = Calories.dailyEnergy(
+        strainHr,
+        profile: WorkoutUserProfile(weightKg: weightKg, heightCm: heightCm,
+            age: age, sex: workoutSex(sex)),
+        hrmax: hrMax, restingHr: rhrForTrimp,
+        cadenceSpmPerMin: cadence == null ? null : [
+          for (final i in strainSeconds) cadenceByMinute[d.dayTsSec[i] ~/ 60],
+        ],
+      );
+      // The library prices each supplied observation as one minute. This is
+      // the 1 Hz ledger: convert its active-energy sum to recorded seconds.
+      caloriesKcal = energy == null ? null : energy.active / 60;
+
+    }
+  }
+
+  // HEADLINE STRAIN = 0–21 map of the TRIMP earned ABOVE the quiet-waking
+  // baseline; raw TRIMP kept as a detail. `perMin` is the wake window the TRIMP
+  // was accumulated over, so it sets the baseline that gets subtracted.
+  final rawTrimp = trimp.present ? trimp.value : null;
+  final koopStrainMetric = strainScoreMetric(
+    rawTrimp,
+    wakeMinutes: perMin.isEmpty ? null : perMin.length.toDouble(),
+    // THE REFERENCE LEVEL, NOT THIS USER'S (edge#226 is still open). analytics
+    // stopped defaulting the quiet-waking level so every caller has to state
+    // which one it means; `quietWakingHrr` is the constant the anchor table was
+    // generated at, so passing it reproduces the strain this app ships today
+    // and nobody's number moves on this commit. The real level is
+    // `dailyQuietWakingHrr` fed through a rolling personal median — a trait,
+    // not a day, and the workout scorers need the same one the day uses or a
+    // bout subtracts its own effort away. That plumbing is edge#226.
+    // ponytail: population constant, swap for the rolling personal median when
+    // edge#226 lands — see the same comment at the other four call sites.
+    quietHrr: quietHrr,
+    female: workoutSex(sex) == 'female',
+  );
+  // WHOOP-MATCHED DAY STRAIN (whoop_calibration.dart, the owner's choice,
+  // v112): minutes in WHOOP's own zones plus the cost of a worn day, fitted to
+  // the owner's export. It takes the score only where Koop's own scorer was
+  // allowed to score — same anchors, same gates — so an absent strain stays
+  // absent. The Banister TRIMP stays as the detail (`trimp`).
+  final whoopLoad = whoopStrainLoad(strainHr, rhrForTrimp, hrMax,
+      sampleDurationMin: 1 / 60);
+  final strainMetric = !koopStrainMetric.present || whoopLoad == null
+      ? koopStrainMetric
+      : Metric<double>(
+          value: whoopDayStrain(load: whoopLoad, wornMin: wornMin.toDouble()),
+          confidence: koopStrainMetric.confidence,
+          tier: koopStrainMetric.tier,
+          inputs_used: const ['hr_1hz', 'resting_hr', 'max_hr', 'worn_min'],
+          note: 'WHOOP-matched day strain: minutes in WHOOP heart-rate zones '
+              '(40/60/70/80/90 % of reserve) plus the cost of a worn day',
+        );
+
+  // ── curve series for the UI ────────────────────────────────────────────────
+  final hrCurve = _downsampleHr(d.dayTsSec, d.dayHr);
+  final hypnogram = _hypnogramSegments(d);
+  // `nnTimes` is re-based to ~0 by `correctRr` (it sums RR intervals from a
+  // zero clock), so the timeline needs the wall-clock instant that clock starts
+  // at: the START of the first RR interval = its END stamp minus its own
+  // length. Without it the stored `t` was seconds-since-first-beat on a view
+  // (`v_series`) whose contract — and the coach prompt — say epoch seconds.
+  final hrvOriginMs = (d.sleepRrTsMs.isEmpty || d.sleepRrMs.isEmpty)
+      ? null
+      : d.sleepRrTsMs.first - d.sleepRrMs.first;
+  final hrvTimeline = buildHrvTimeline(nn, nnTimes, hrvOriginMs);
+  // CV-06 — the SHAPE of the night: per-bin RMSSD over the same cleaned NN the
+  // headline uses, so the curve and the number can never disagree. Bins that
+  // fall under the beat floor stay in the series as HOLES on purpose — dropping
+  // them lets a reader draw a straight line across a charging gap and call it
+  // flat variability. Every bin ships lo/hi: render a BAND, not a line.
+  //
+  // A DESCRIPTION, never a cause. A suppressed first third is equally
+  // consistent with alcohol, a late meal, late training, a warm room, illness
+  // onset, or nothing, and nothing here can tell those apart.
+  //
+  // `startSec` is seconds from the FIRST BEAT, not an epoch — `origin_ms` is
+  // the wall-clock instant that clock starts at, the same `hrvOriginMs` the
+  // timeline above is placed on.
+  final nightShape = nightHrvShape(nn, nnTimes);
+  final strainCurve = strainMetric == koopStrainMetric
+      ? _strainCurve(
+          wakeHr,
+          restingHr: rhrForTrimp,
+          maxHr: hrMax,
+          sex: sex,
+          quietHrr: quietHrr,
+        )
+      : whoopStrainCurve([for (final i in strainSeconds) d.dayTsSec[i]],
+          strainHr, rhrForTrimp, hrMax, wornMin.toDouble(),
+          sampleDurationMin: 1 / 60);
+  final zoneTimeline = zoneSet == null
+      ? const <Map<String, num>>[]
+      : _zoneTimeline(wakeHr, zoneSet);
+
+  // ── ASSEMBLE the bundle (envelopes are plain JSON) ─────────────────────────
+  // ── HRV stability (CV = SDNN/meanNN) + Poincaré irregular-beat screen ──────
+  // Both over the sleep NN. CV is a normalized variability stability index;
+  // SD1/SD2 are the Poincaré descriptors; a high SD1/SD2 ratio flags erratic
+  // beat-to-beat timing (a SCREEN, not a diagnosis).
+  double? hrvCv;
+  if (nn.length >= 20) {
+    final meanNn = nn.reduce((a, b) => a + b) / nn.length;
+    final sdnn = hrvT.present ? hrvT.value!.sdnn : null;
+    if (sdnn != null && meanNn > 0) hrvCv = sdnn / meanNn * 100;
+  }
+  // SLEEP Poincaré screen — the SHARED analytics one, called exactly the way
+  // `irregular24h` above is. Edge used to hand-roll a second copy here, which
+  // meant it never got the three fixes analytics made to the shared screen: it
+  // differenced straight down the compacted NN (so every artifact run the
+  // corrector dropped manufactured one huge spurious difference, inflating
+  // sdsd → sd1), it published `sd2: 0.0` with `flag: false` on a degenerate
+  // series — "perfectly regular" as a measurement of nothing — and its
+  // confidence was a hard-coded 0.5 however noisy the night was.
+  final irregularSleep = irregularBeatScreen(
+    nn,
+    nnTimesMs: nnTimes,
+    artifactFraction: artifactFraction,
+  );
+  final irrSleep = irregularSleep.present ? irregularSleep.value : null;
+
+  final clinical = <String, dynamic>{
+    'hrv_time': hrvT.toJson((v) => v.toJson()),
+    // HRV stability (CV %) + Poincaré irregular-beat screen.
+    'cv': hrvCv == null ? null : _round(hrvCv, 1),
+    // Keys kept as-is (Investigate reads sd1/sd2/flag); absent is null, not a
+    // zero and not a "clear".
+    'irregular': <String, dynamic>{
+      'sd1': irrSleep == null ? null : _round(irrSleep.sd1, 1),
+      'sd2': irrSleep == null ? null : _round(irrSleep.sd2, 1),
+      'flag': irrSleep?.flag,
+      'confidence': irregularSleep.present
+          ? _round(irregularSleep.confidence, 4)
+          : 0.0,
+      'note': irregularSleep.note,
+    },
+    // 24/7 irregular-rhythm SCREEN over the whole-day RR (the headline screen
+    // that drives the opt-in notification). Sleep-only `irregular` kept above.
+    'irregular_24h': irregular24h.toJson((v) => v.toJson()),
+    // Breathing-rate variability trend (within-user only).
+    'brv': brv.toJson((v) => v.toJson()),
+    // Canonical nightly HRV, matching the sleep-session windowed RMSSD
+    // aggregation over the chosen sleep session. The robust estimator is
+    // retained alongside it as a secondary detail for comparison/debugging.
+    'rmssd_sleep_session': {
+      'value': sleepSessionRmssd == null ? '—' : _round(sleepSessionRmssd, 1),
+      'confidence': headlineRmssdMetric.present
+          ? _round(headlineRmssdMetric.confidence, 4)
+          : 0,
+      'tier': Tier.high,
+      'inputs_used': headlineRmssdMetric.inputs_used,
+      'note': headlineRmssdMetric.note,
+      // Which formulation produced the headline, and the plain session mean
+      // beside it, so a change in method is visible on the day it happened.
+      'method': weightedRmssdMetric.present ? 'weighted_overlap' : 'session_mean',
+      'session_mean': sleepSessionRmssdMetric.present
+          ? _round(sleepSessionRmssdMetric.value!, 1)
+          : null,
+    },
+    'rmssd_nocturnal': robustRmssd.toJson(),
+    'hrv_freq': hrvF.toJson((v) => v.toJson()),
+    'resting_hr': rhr.toJson((v) => v.toJson()),
+    'hr_dip': dip.toJson((v) => v.toJson()),
+    'prsa_dc': dc.toJson((v) => v.toJson()),
+    'prsa_ac': ac.toJson((v) => v.toJson()),
+    'readiness_lnrmssd': lnReadiness.toJson((v) => v.toJson()),
+    'readiness_composite': composite.toJson((v) => v.toJson()),
+    // Which formula produced the headline, and the inputs the WHOOP-matched
+    // one used, so a recovery can always be explained.
+    'readiness_method': {
+      'method': recoveryWhoop != null
+          ? 'whoop_calibrated'
+          : (shownParts != null ? 'whoop_calibrated_early' : 'composite'),
+      'composite_score': compositeScalar,
+      'sleep_performance': perfNight,
+      // intercept + each input's points = the published number (before the
+      // 1–99 hold). Null when the composite produced the number.
+      'parts': shownParts?.toJson(),
+    },
+    // Headline 0–21 strain envelope; raw Banister TRIMP kept as `trimp`.
+    // The ROOT cause replaces the shared scorer's "strain needs a TRIMP and the
+    // wake window it was measured over" — true, and useless to a reader, since
+    // it names a sibling metric rather than the input that is actually missing.
+    'strain': {
+      ...strainMetric.toJson(),
+      if (!strainMetric.present)
+        'note': strainAbsentNote ?? strainMetric.note ?? kUnknownAbsenceNote,
+    },
+    'trimp': trimp.toJson(),
+  };
+
+  // Sleep section — ALL fields from the single SleepSegmentation. We re-emit the
+  // serve-seam-expected envelopes (window/accounting/stager .value sub-maps) but
+  // every figure traces to the one segmentation result (no second estimator).
+  final sleep = <String, dynamic>{
+    'window': _envelope(
+      hasSleep ? sleepWinJson : null,
+      confidence: sleepConf,
+      tier: Tier.high,
+      inputs: const ['accel_1hz', 'hr_1hz'],
+    ),
+    'accounting': _envelope(
+      hasSleep
+          ? {
+              'tst_sec': tstSec,
+              'waso_sec': wasoSec,
+              'in_bed_sec': inBedSec,
+              // Wall-clock in-bed MINUS the seconds nobody watched. This is the
+              // denominator `efficiency_pct` actually uses.
+              'unobserved_sec': unobservedSec,
+              'observed_in_bed_sec': (inBedSec == null || unobservedSec == null)
+                  ? null
+                  : math.max(0, inBedSec - unobservedSec),
+              'efficiency_pct': effPct,
+              'nrem_sec': nremSec,
+              // 4-class split: Light + Deep == NREM. Deep is LOW CONFIDENCE.
+              'light_sec': lightSec,
+              'deep_sec': deepSec,
+              'rem_sec': remSec,
+              'wake_sec': wakeSec,
+              'deep_low_confidence': true,
+              // SLP-03 — the shape of the night, from the same per-second labels
+              // the hypnogram is drawn from. `awakenings` is a FLOOR (wake
+              // specificity is 29-52 %, so the true count is higher) and
+              // `longest_sleep_sec` never bridges an unobserved gap.
+              ...runs,
+            }
+          : null,
+      confidence: sleepConf,
+      tier: Tier.estimate,
+      inputs: const ['sleep_stages'],
+    ),
+    // Why this night produced nothing, when the segmenter knows. Null on a
+    // normal night; never render a bare dash for an absence that carries one.
+    'absence_reason': absenceReason,
+    'stager': _envelope(
+      hasSleep
+          ? {
+              'wake_pct': tstSec == null || inBedSec == null || inBedSec == 0
+                  ? null
+                  : 100.0 * (wakeSec ?? 0) / inBedSec,
+              'nrem_pct': tstSec == null || tstSec == 0
+                  ? null
+                  : 100.0 * (nremSec ?? 0) / tstSec,
+              'rem_pct': tstSec == null || tstSec == 0
+                  ? null
+                  : 100.0 * (remSec ?? 0) / tstSec,
+              'epoch_sec': 1,
+              'epochs': d.hypnoStages.length,
+            }
+          : null,
+      confidence: sleepConf,
+      tier: Tier.estimate,
+      inputs: const ['hr_1hz', 'immobility'],
+    ),
+    // CPC is WITHDRAWN, not merely absent. Its "respiration surrogate" was the
+    // NN series itself, so cpc_ratio was the RR periodogram HF/LF ratio wearing
+    // a different name (measured agreement 1.0000085) — never cardiopulmonary
+    // coupling. Reinstate only with a real respiration channel in the
+    // signature; until then there is nothing honest to publish here.
+  };
+
+  final respiration = <String, dynamic>{
+    'rsa': resp.toJson((v) => v.toJson()),
+    'cvhr_apnea': cvhr.toJson((v) => v.toJson()),
+    'odi': odi.toJson((v) => v.toJson()),
+  };
+
+  final wellness = <String, dynamic>{
+    'skin_temp': {
+      'value': skinTempZ == null ? '—' : _round(skinTempZ, 4),
+      'confidence': skinTempZ == null ? 0 : 0.5,
+      'tier': Tier.relative,
+      // Both columns: gen4 stores a raw ADC count, gen5 centi-°C. Either way
+      // this is only ever a deviation from the user's OWN baseline. The two
+      // never mix within one day's array — see derive_prepare.dart's
+      // _skinTempFor / _skinTempUnit for the read-side gate.
+      'inputs_used': const ['skin_temp_raw', 'skin_temp_c'],
+      'note':
+          'relative deviation (z) vs your baseline; raw sensor units, '
+          'never an absolute °C',
+    },
+  };
+
+  // Indexed scalars (also surfaced to metric_series by the engine).
+  // The headline and Recovery must share one quality gate. Secondary
+  // estimators remain in clinical detail, never replace a refused headline.
+  final rmssdScalar = sleepSessionRmssd;
+  // Whole-window RMSSD kept available as a secondary detail (NOT the headline).
+  final rmssdWholeScalar = (hrvT.present && hrvT.value!.rmssd != null)
+      ? hrvT.value!.rmssd
+      : null;
+  // Abstain from a saturated, degenerate-baseline readiness rather than persist a
+  // bogus ~100 that a cleaner re-derive would then snap back down (#117 bounce).
+  final readinessScalar = recoveryWhoop ?? compositeScalar;
+  // The z-cap can abstain even when the composite itself is `present` — a
+  // saturated, degenerate-baseline artefact, not a cold-start — and that used
+  // to leave `readinessAbsentDiag` null (only the `!composite.present` branch
+  // above sets it), so the UI fell through to the composite's own prose, which
+  // names whichever driver its renormalisation happened to refuse (e.g. temp)
+  // rather than the real reason the headline is blank (edge#305). Do NOT reuse
+  // `need_baseline:` here: on main an input needs >=`readinessCompositeMinBaseline`
+  // points before the composite is even present, so by the time THIS branch can
+  // fire "Need N more nights" is a proven-false cause. Give it its own reason,
+  // carrying the z that tripped the cap plus the same per-input counts the
+  // cold-start diag carries, so it renders with an actual explanation instead
+  // of a bare blank.
+  final zCapNote = zCapAbsentNote(composite);
+  if (readinessAbsentDiag == null && zCapNote != null) {
+    readinessAbsentDiag = {
+      'hrv': {'value': lnToday != null, 'baseline_n': d.lnRmssdHistory.length},
+      'rhr': {'value': rhrToday != null, 'baseline_n': d.rhrHistory.length},
+      'resp': {'value': respToday != null, 'baseline_n': d.respHistory.length},
+      'temp': {
+        'value': skinTempAdc != null,
+        'baseline_n': d.skinTempAdcHistory.length,
+        'settled_frac': skinTempSettledFrac,
+      },
+      'note': zCapNote,
+    };
+  }
+  final strainScalar = strainMetric.present ? strainMetric.value : null;
+
+  // ── STRESS: Baevsky SI → a transparent 0–100 score (log-mapped over the
+  //    plausible resting SI range [20, 600]). Resting autonomic tension; the
+  //    stress screen reads this {score, si, lf_hf, rmssd, level} block directly.
+  final si = stress.present ? stress.value!.si : null;
+  final lfhf = hrvF.present ? hrvF.value!.lfhf : null;
+  final stressScore = si == null ? null : _stressScoreOfSi(si);
+  // Per 15 minutes of the whole day, from heart rate above this night's
+  // resting rate — see [hrStressPerWindow] for why not the beat-timing SI.
+  final stressDay = hrStressPerWindow(
+    tsSec: d.dayTsSec,
+    hr: d.dayHr,
+    activityClass: d.dayActivityClass,
+    restingHr: rhrToday,
+    maxHr: hrMax,
+  );
+  final stressBlock = <String, dynamic>{
+    'value': stressScore == null ? '—' : _round(stressScore, 1),
+    'score': stressScore == null ? null : _round(stressScore, 1),
+    'si': si == null ? null : _round(si, 2),
+    'level': stress.present ? stress.value!.level : null,
+    'lf_hf': lfhf == null ? null : _round(lfhf, 3),
+    'rmssd': rmssdScalar == null ? null : _round(rmssdScalar, 1),
+    'confidence': stress.present ? _round(stress.confidence, 4) : 0,
+    'tier': Tier.estimate,
+    'inputs_used': const ['rr_cleaned'],
+    'note': 'Baevsky Stress Index → 0–100; resting autonomic tension (PRV).',
+  };
+
+  // ── SpO₂ — REFUSED, permanently. See kSpo2Refusal above: the red and IR
+  //    ADCs are one signal, so there is no oxygen metric to publish from them
+  //    at any tier, relative or otherwise. The block stays so old bundles keep
+  //    a shape, and it says why.
+  final rejectCounts = odi.present ? odi.value!.rejectCounts : null;
+  final severityCounts = odi.present ? odi.value!.severityCounts : null;
+  final spo2Block = <String, dynamic>{
+    'disabled': true,
+    'value': null,
+    'odi_per_hour': null,
+    'dip_count': null,
+    'analyzed_hours': null,
+    'mean_dip_pct': null,
+    'max_dip_pct': null,
+    'longest_dip_sec': null,
+    'burden_pct': null,
+    'signal_coverage': null,
+    'trusted_coverage': null,
+    'reject_counts': rejectCounts,
+    'severity_counts': severityCounts,
+    'confidence': 0,
+    'tier': Tier.relative,
+    'inputs_used': const ['spo2_red_raw', 'spo2_ir_raw'],
+    'note': kSpo2Refusal,
+    'debug': <String, dynamic>{
+      'sleep_samples': d.sleepTsSec.length,
+    },
+  };
+
+  // ── NOCTURNAL detail: sleeping-HR nadir + waking HR. Both computable today
+  //    with NO baseline; the "vs baseline" comparison is added at the seam from
+  //    the rhr history series.
+  // The LOWEST MINUTE, not the lowest sample: the minimum of 1-minute
+  // medians of the valid (>= kHrFloorBpm) sleep HR, and that minute's time.
+  // The 1st-percentile sample took a dropout glitch as the night's nadir (a
+  // 25 bpm reading on a 51 bpm night), and its time came from a different
+  // sample than its value. Only on a night with a resting HR, as before.
+  final nadirMin = rhr.present ? _lowestMinute(d.sleepTsSec, d.sleepHr) : null;
+  final nadir = nadirMin?.bpm;
+  final wakingHr = dip.present ? dip.value!.dayMean : null;
+  // Nadir INSTANT: epoch-second of the lowest valid sleeping-HR second, so the
+  // nocturnal card can render "@ HH:MM" instead of "@ -". From the sleep-window
+  // HR series (parallel to sleepTsSec); null when no valid sleep HR.
+  final nadirTs = nadirMin?.tsSec;
+
+  // ── HR stats over the day's valid HR (for the strain detail hr {max,avg,min}).
+  //
+  // THE DAY PEAK GOES THROUGH THE SAME SMOOTHING AS EVERY WORKOUT PEAK (#127).
+  // This used to be a bare `reduce(math.max)` over raw 1 Hz, so one PPG motion
+  // transient WAS the day's "Peak HR" on the strain card while the Heart page —
+  // reading per-minute means — showed the real peak: the 160-vs-143 pair the
+  // issue reported, moved to a different screen rather than fixed. `hr_max.dart`
+  // is the one definition (physiological reject + 5 s rolling median, which
+  // steps over a 1-2 s spike but keeps a genuine brief effort peak). Min is the
+  // symmetric case: a 1 s dropout must not define the day's low either.
+  final dayHrInt = [for (final h in dayHrValid) h.round()];
+  final hrStats = dayHrValid.isEmpty
+      ? null
+      : {
+          'max': smoothedMaxHr(dayHrInt, age: age?.round()) ??
+              dayHrValid.reduce(math.max).round(),
+          'min': smoothedMinHr(dayHrInt, age: age?.round()) ??
+              dayHrValid.reduce(math.min).round(),
+          'avg': _meanWelford(dayHrValid)!.round(),
+        };
+
+  // ── SLEEP CYCLES from the per-second hypnogram (NREM→REM completions).
+  // Sleep cycles — Rosenblum 2024 "fractal cycles", HRV-adapted: peak-to-peak of
+  // the smoothed per-minute RMSSD series (REM peaks / NREM troughs), NOT
+  // categorical REM-episode counting. Over the sleep window's RR.
+  final cyc = detectSleepCycles(
+    d.sleepRrMs,
+    d.sleepRrTsMs,
+    d.sleepOnsetSec,
+    d.sleepOffsetSec,
+  );
+  sleep['cycles'] = [for (final c in cyc.cycles) c.toJson()];
+  sleep['cycle_count'] = cyc.n;
+  sleep['cycles_mean_min'] = cyc.meanDurationMin;
+  // The SAME detection, in its published Metric envelope. `detectSleepCycles`
+  // is the bare algorithm and returns n=0 both for "no cycles" and for "not
+  // enough RR to look" — indistinguishable downstream, and the raw keys above
+  // carry no tier or confidence, so the UI had to assert its own. This is the
+  // honest wrapper: ESTIMATE tier, HRV-derived, absent with a reason when the
+  // window cannot support detection. The raw keys stay for existing readers.
+  sleep['cycles_metric'] = sleepCyclesMetric(
+    d.sleepRrMs,
+    d.sleepRrTsMs,
+    d.sleepOnsetSec,
+    d.sleepOffsetSec,
+  ).toJson((v) => v.toJson());
+  // The continuous z-RMSSD wave the cycle GRAPH plots ({t: epochSec, z}).
+  sleep['cycle_series'] = cyc.series;
+
+  // ── PERSONAL BASELINES (Winsorized-EWMA) ───────────────────────────────────
+  // Robust, recency-weighted personal centers + spread for the metrics whose
+  // units match the engine configs (rhr bpm, hrv RMSSD ms, resp brpm). Fold the
+  // trailing history + today's value, then z/delta/ratio + cold-start status.
+  // ADDITIVE: a richer, calibration-honest baseline block the recovery/illness
+  // layer can consume; the existing readiness/skin_temp_z headlines are untouched.
+  // skin_temp is intentionally EXCLUDED — its series is raw ADC, not the °C the
+  // skin_temp cfg bounds expect, so feed it through a raw-ADC cfg instead.
+  Map<String, dynamic> baselineBlock(
+    List<double> history,
+    double? today,
+    MetricCfg cfg,
+  ) {
+    final state = Baselines.foldHistory(<double?>[
+      for (final v in history) v,
+    ], cfg);
+    // NO STATE → NO DEVIATION. `foldHistory` returns null when not one usable
+    // night has been folded; it used to hand back a state seeded at the
+    // MIDPOINT of the metric's physiological bounds, and z/delta/ratio/
+    // in_normal_range were then computed against a number nobody measured
+    // (z ≈ −13 on a first night). Today's reading still publishes — it IS a
+    // measurement — but the comparison withholds, with its reason.
+    if (state == null) {
+      return <String, dynamic>{
+        'baseline': null,
+        'spread': null,
+        'n_valid': 0,
+        'nights_since_update': 0,
+        'status': BaselineStatus.calibrating.name,
+        'value': today,
+        'z': null,
+        'delta': null,
+        'ratio': null,
+        'in_normal_range': null,
+        'note': 'no_baseline:have=0,need=1',
+        'mdc': null,
+        'mdc_multiples': null,
+      };
+    }
+    final dev = today == null ? null : Baselines.deviation(today, state);
+    // RESP-03 — the change in DETECTABLE units. MDC = 1.96·√2·typical error;
+    // `deviation` already treats σ as 1.253·spread (mean-abs-dev → sd), so feed
+    // that same σ rather than a second convention. Null spread ⇒ no honest noise
+    // estimate ⇒ never claim a change. `mdc_multiples` is signed: −1.4 is 1.4
+    // MDC BELOW your own normal, which for HRV is the direction that matters.
+    final sigma = 1.253 * state.spread;
+    final m = mdc(
+      RobustBaseline(
+        center: state.baseline,
+        scale: sigma,
+        nValid: state.nValid,
+        nWindow: state.nValid,
+        sufficient: true,
+      ),
+    );
+    return <String, dynamic>{
+      ...state.toJson(),
+      'value': today,
+      'z': dev == null ? null : _round(dev.z, 3),
+      'delta': dev == null ? null : _round(dev.delta, 3),
+      'ratio': dev == null ? null : _round(dev.ratio, 4),
+      'in_normal_range': dev?.inNormalRange,
+      'mdc': m == null ? null : _round(m, 3),
+      'mdc_multiples': (m == null || m <= 0 || dev == null)
+          ? null
+          : _round(dev.delta / m, 2),
+    };
+  }
+
+  final baselines = <String, dynamic>{
+    'resting_hr': baselineBlock(
+      d.rhrHistory,
+      rhrToday,
+      Baselines.restingHRCfg,
+    ),
+    'hrv': baselineBlock(d.rmssdHistory, rmssdScalar, Baselines.hrvCfg),
+    'resp': baselineBlock(d.respHistory, respToday, Baselines.respCfg),
+    'skin_temp': baselineBlock(
+      d.skinTempAdcHistory,
+      skinTempAdc,
+      _skinTempAdcCfg,
+    ),
+  };
+
+  return <String, dynamic>{
+    'date': d.date,
+    'day_confidence': _round(d.dayConfidence, 4),
+    'flags': d.dayFlags,
+    'clinical': clinical,
+    'baselines': baselines,
+    'sleep': sleep,
+    'zones': hrZones,
+    'max_hr_used': hrMax,
+    // TS-04 — WHICH ANCHORS the `zones` block above was binned on, stored with
+    // the bins so a later reader can never present them as something they are
+    // not. 'karvonen' = observed ceiling + measured resting HR, 'observed' =
+    // measured ceiling only, 'tanaka' = the age estimate. Null when there were
+    // no zones. TS-05's 28-day distribution is gated on this, not captioned.
+    // WHICH STRAP measured this day, echoed onto the bundle. The zone ceiling
+    // is a per-family constant, so a screen printing zone EDGES has to name the
+    // strap — and `decoded_onehz` is pruned at ~3 days, so the derived day is
+    // the only place that provenance survives a quiet week.
+    'device_family': d.deviceFamily,
+    'zone_source': zoneSet?.source,
+    'zone_max_hr': zoneSet == null ? null : _round(zoneSet.maxHr, 0),
+    'zone_lower_bpm': zoneSet == null
+        ? null
+        : [for (final z in zoneSet.zones) _round(z.lower, 0)],
+    'hr_stats': ?hrStats,
+    'calories': caloriesKcal == null ? null : _round(caloriesKcal, 0),
+    // WHY each absent activity figure is absent, keyed BY THE FIGURE'S OWN
+    // NAME. `zones`, `max_hr_used`, `calories` and `calories_total` are stored
+    // as bare values, so there is no envelope on them to carry a tier and a
+    // note — this is where their reason lives, and the serve seam
+    // (`LocalRepositoryImpl.getDayStrain`) attaches it to the value it hands a
+    // screen. A key is present ONLY when that figure is absent.
+    //
+    // `calories_total` is the engine's (`_applyWakeDayFeatures`); it is listed
+    // here so the two calorie figures cannot end up explained differently when
+    // one gate killed both.
+    'absent_notes': <String, String>{
+      if (hrMax == null && ceilingAbsentNote != null)
+        'max_hr_used': ceilingAbsentNote,
+      if (hrZones.isEmpty && zonesAbsentNote != null) 'zones': zonesAbsentNote,
+      if (caloriesKcal == null && caloriesAbsentNote != null) ...{
+        'calories': caloriesAbsentNote,
+        'calories_total': caloriesAbsentNote,
+      },
+      if (strainScalar == null)
+        'strain': strainAbsentNote ?? strainMetric.note ?? kUnknownAbsenceNote,
+      if (!trimp.present)
+        'trimp': strainAbsentNote ?? trimp.note ?? kUnknownAbsenceNote,
+    },
+    'respiration': respiration,
+    // CV-06 (see `nightShape` above). Envelope + the epoch origin its bin
+    // offsets are counted from; null origin means there were no beats to place.
+    'hrv_night_shape': {
+      ...nightShape.toJson((v) => v.toJson()),
+      'origin_ms': hrvOriginMs,
+    },
+    'wellness': wellness,
+    'stress': stressBlock,
+    'stress_day': stressDay,
+    'spo2': spo2Block,
+    'series': {
+      'hr_curve': hrCurve,
+      'strain_curve': strainCurve,
+      'zone_timeline': zoneTimeline,
+      'hrv_timeline': hrvTimeline,
+      'hypnogram': hypnogram,
+    },
+    'coverage': {
+      'hr_samples': d.dayHr.length,
+      'hr_valid': dayHrValid.length,
+      'rr_beats': d.sleepRrMs.length,
+      'nn_clean': nn.length,
+      'clean_fraction': _round(corrected.cleanFraction, 4),
+      'sleep_seconds': inBedSec ?? 0,
+    },
+    'readiness_absent_diag': ?readinessAbsentDiag,
+    // The quiet-waking level this day's strain subtracted (quiet_level.dart),
+    // only on a day that scored strain.
+    'strain_quiet_hrr': ?(strainScalar == null ? null : quietHrr),
+    'scalars': {
+      // ONE resting HR. It is nocturnal or it is absent — `rhr` and
+      // `rhr_nocturnal` are now the same number, and the second key survives
+      // only so the strain recompute keeps reading a key that was never wrong
+      // on a bundle stored before this change. Two keys, one honest and one
+      // not, is how the daytime fallback outlived the v46→47 fix: readiness
+      // moved to the gated key and the CHARTED series stayed on the ungated
+      // one. Delete `rhr_nocturnal` with the kAlgoVersion bump that re-derives
+      // every stored bundle.
+      'rhr': rhrToday,
+      'rhr_nocturnal': rhrToday,
+      // Headline RMSSD (robust nocturnal, NREM). Whole-window kept separately.
+      'rmssd': rmssdScalar,
+      'rmssd_whole': rmssdWholeScalar,
+      'readiness': readinessScalar,
+      // Persist this night's score with its duration. The cross-day pass only
+      // updates Today; without this, reanalysed past nights keep an old score.
+      'sleep_perf': perfNight,
+      // The early estimate (see where it is computed). Null whenever the full
+      // score exists, and never charted: it is not a reading of the series.
+      'readiness_early': readinessEarlyScalar,
+      // Population rough guide for nights 1–4 (see roughReadinessScalar).
+      'readiness_rough': readinessRoughScalar,
+      // Headline 0–21 strain (the screens already expect a 0–21 scale); raw
+      // Banister TRIMP stays under `trimp` as the secondary "training load".
+      'strain': strainScalar,
+      // This day's measured quiet-waking HRR (null when it cannot be measured).
+      // The level its strain was scored against is `strain_quiet_hrr` on the
+      // bundle — a scalar that is always present would make an empty day look
+      // measured and lock it (derive_result_protection_test).
+      'quiet_hrr': quietToday,
+      'max_hr_used': hrMax,
+      'ln_rmssd': lnToday,
+      'resp_rate': respToday,
+      'skin_temp_z': skinTempZ,
+      'skin_temp_delta_c':
+          skinTempDeltaC == null ? null : _round(skinTempDeltaC, 2),
+      // RAW nightly skin-temp ADC mean — the personal BASELINE series for
+      // skin_temp_z. ALWAYS present when there's sleep+temp data (even while z is
+      // still null in the ≤3-day bootstrap), so the series fills and z starts
+      // computing from ~day 4. This is the series _attachHistory must feed back.
+      'skin_temp_adc': skinTempAdc,
+      // WH-11a — the fraction of the sleep window the temp channel actually
+      // covered. Emitted, NOT gated on: no floor is defensible until we have
+      // looked at what this reads on real nights.
+      'skin_temp_coverage_frac': skinTempCoverage == null
+          ? null
+          : _round(skinTempCoverage, 4),
+      // RD-15 — the settled fraction readiness's temp driver is gated on, so a
+      // night whose driver was refused can be told apart from one where the
+      // gate never ran. NULL means the fraction itself is unmeasurable (no
+      // settle band for this band's family, or under sixty samples).
+      'skin_temp_settled_frac': skinTempSettledFrac == null
+          ? null
+          : _round(skinTempSettledFrac, 4),
+      'sdnn': hrvT.present ? hrvT.value!.sdnn : null,
+      // CV-03 — deceleration capacity (ms). Personal trend only: PRSA anchors on
+      // decelerations and pulse-arrival jitter attenuates DC by an amount that
+      // varies with signal quality night to night, so a rising line can be a
+      // cleaner-signal line. Never a reference range, never a threshold.
+      'prsa_dc': dc.present ? _round(dc.value!.capacity, 3) : null,
+      // The anchors it was averaged over — belongs next to the number, always.
+      'prsa_dc_anchors': dc.present ? dc.value!.anchors.toDouble() : null,
+      'dip_pct': dip.present ? dip.value!.dipPct : null,
+      'trimp': trimp.present ? trimp.value : null,
+      'odi_per_hour': null,
+      // Stress score (0–100) + SI for trends.
+      'stress': stressScore,
+      'stress_si': si,
+      'spo2': null,
+      // Active calories (Keytel) + nocturnal HR detail (nadir / waking HR).
+      'calories': caloriesKcal == null ? null : _round(caloriesKcal, 0),
+      'sleeping_hr_nadir': nadir,
+      'sleeping_hr_nadir_ts': nadirTs?.toDouble(),
+      'waking_hr': wakingHr,
+      // Sleep-stage minutes + HRV freq/stability — surfaced as scalars so they
+      // flow to metric_series and get day/week/month/3M trends.
+      'rem_min': remSec == null ? null : (remSec / 60).roundToDouble(),
+      'deep_min': deepSec == null ? null : (deepSec / 60).roundToDouble(),
+      'light_min': lightSec == null ? null : (lightSec / 60).roundToDouble(),
+      'tst_min': tstSec == null ? null : (tstSec / 60).roundToDouble(),
+      'lf_hf': lfhf == null ? null : _round(lfhf, 3),
+      'hrv_cv': hrvCv == null ? null : _round(hrvCv, 1),
+      // 24/7 irregular-rhythm screen flag (1/0) → drives trend + notification.
+      'irregular_rhythm_flag': irregular24h.present
+          ? (irregular24h.value!.flag ? 1.0 : 0.0)
+          : null,
+      // Breathing-rate variability (CV) + Theil-Sen trend slope.
+      'brv_cv': brv.present ? _round(brv.value!.cv, 4) : null,
+      'brv_slope': brv.present && brv.value!.trendSlope != null
+          ? _round(brv.value!.trendSlope!, 4)
+          : null,
+      // Sleep efficiency % + worn minutes → their own day/week/month/3M trends.
+      'efficiency': effPct == null ? null : _round(effPct, 1),
+      'worn_min': wornMin == 0 ? null : wornMin.toDouble(),
+      // SLP-01 — minutes of the in-bed window nobody watched. Trended so a band
+      // that has started dropping hours shows up as a trend, not as worse sleep.
+      'unobserved_min': unobservedSec == null
+          ? null
+          : (unobservedSec / 60).roundToDouble(),
+      // SLP-03 — sustained awakenings (a floor) + the longest unbroken stretch.
+      'awakenings': (runs['awakenings'] as int?)?.toDouble(),
+      'longest_sleep_min': (runs['longest_sleep_sec'] as int?) == null
+          ? null
+          : ((runs['longest_sleep_sec'] as int) / 60).roundToDouble(),
+      // SLP-02 — forced-window sleep-onset latency only (see [_sleepRuns]).
+      'sol_min': (runs['sol_sec'] as int?) == null
+          ? null
+          : ((runs['sol_sec'] as int) / 60).roundToDouble(),
+      // SLP-09 / L10 — WHERE ON THE CLOCK the night sat. Mid-sleep is computed
+      // every night and was thrown away; nothing can reconstruct it once the
+      // 1 Hz substrate is pruned, so the value of writing it is that history
+      // starts accruing NOW. FUTURE NIGHTS ONLY — there is no backfill and
+      // there cannot be one.
+      //
+      // Both are tz-corrected LOCAL clock positions in seconds, signed,
+      // relative to 04:00 local — see [sleepClockOffsetSec] for why they are
+      // not a plain second-of-day.
+      'midsleep_sec': sleepClockOffsetSec(
+        d.sleepOffsetSec > d.sleepOnsetSec && d.sleepOnsetSec > 0
+            ? d.sleepOnsetSec + (d.sleepOffsetSec - d.sleepOnsetSec) ~/ 2
+            : 0,
+      ),
+      'sleep_onset_sec': sleepClockOffsetSec(
+        d.sleepOffsetSec > d.sleepOnsetSec ? d.sleepOnsetSec : 0,
+      ),
+    },
+  };
+}
+
+/// The anchor the two SLP-09 clock series are measured from: 04:00 local.
+///
+/// Any fixed hour would do; 04:00 is the one furthest from a normal bedtime
+/// AND from a normal wake time, so neither series sits near the wrap.
+const int _sleepClockAnchorSec = 4 * 3600;
+
+/// A sleep instant's LOCAL clock position, in seconds either side of 04:00 —
+/// negative before, positive after. Null for an absent window (never 0, which
+/// is a real reading: exactly 04:00).
+///
+/// STORED UNWRAPPED, and that is the whole point. As a plain second-of-day,
+/// 23:30 → 01:30 is a two-hour shift that reads as MINUS 22 hours, and binary
+/// segmentation over that series finds a beautiful change-point which is a
+/// modulo artifact and nothing else. Measuring signed distance from an anchor
+/// nobody sleeps through puts a night's normal range on one continuous stretch
+/// of the axis, so a difference between two nights is the real difference.
+///
+/// TIMEZONE. Converted with the offset in effect AT THAT INSTANT, not today's:
+/// a flight or a DST transition moves the clock without moving the behaviour,
+/// and a change-point search reading raw UTC would report the flight as a
+/// lifestyle shift. That is the guard, not a nicety — see [tzOffsetSecondsAt].
+double? sleepClockOffsetSec(int epochSec) {
+  if (epochSec <= 0) return null;
+  final local = epochSec + tzOffsetSecondsAt(epochSec);
+  final secOfDay = ((local % 86400) + 86400) % 86400;
+  var offset = secOfDay - _sleepClockAnchorSec;
+  if (offset > 43200) offset -= 86400;
+  if (offset <= -43200) offset += 86400;
+  return offset.toDouble();
+}
+
+// ── helpers (pure) ───────────────────────────────────────────────────────────
+
+/// Per-window RSA respiratory rates (br/min) for the BRV estimator. Buckets the
+/// cleaned NN into [windowMs] (~30-min) bins by beat time and runs [rsaRespRate]
+/// on each bin with ≥[minBeats] beats; keeps only resolved windows.
+List<double> _respPerWindow(
+  List<double> nn,
+  List<double> nnTimes, {
+  double windowMs = 1800000.0,
+  int minBeats = 60,
+}) {
+  if (nn.isEmpty || nn.length != nnTimes.length) return const [];
+  final t0 = nnTimes.first;
+  final binsNn = <int, List<double>>{};
+  final binsTs = <int, List<double>>{};
+  for (var i = 0; i < nn.length; i++) {
+    final idx = ((nnTimes[i] - t0) / windowMs).floor();
+    (binsNn[idx] ??= <double>[]).add(nn[i]);
+    (binsTs[idx] ??= <double>[]).add(nnTimes[i]);
+  }
+  final out = <double>[];
+  final idxs = binsNn.keys.toList()..sort();
+  for (final idx in idxs) {
+    final segNn = binsNn[idx]!;
+    if (segNn.length < minBeats) continue;
+    // NN is already artifact-corrected upstream → artifactFraction 0.
+    final r = rsaRespRate(segNn, binsTs[idx]!, artifactFraction: 0.0);
+    final b = r.present ? r.value!.brpm : null;
+    if (b != null) out.add(b);
+  }
+  return out;
+}
+
+/// Wrap a value sub-map in the {value,confidence,tier,inputs_used} envelope the
+/// serve seam reads via `.value`. Null inner → honest "—".
+Map<String, dynamic> _envelope(
+  Map<String, dynamic>? value, {
+  required double confidence,
+  required String tier,
+  required List<String> inputs,
+}) => {
+  'value': value ?? '—',
+  'confidence': value == null ? 0 : _round(confidence, 6),
+  'tier': tier,
+  'inputs_used': inputs,
+};
+
+/// Build a per-second NREM bool mask ALIGNED to the NN window the robust
+/// nocturnal-RMSSD estimator uses.
+///
+/// `nocturnalRmssd` is t0-relative to `nnTimes.first`, masking a window by its
+/// midpoint SECOND counted from that t0. CRUCIAL: `correctRr` RE-BASES nnTimesMs
+/// to start near zero (NOT epoch ms), so the mask is indexed in seconds elapsed
+/// since the first NN beat — NOT epoch seconds. The first NN beat's absolute
+/// instant is the first ORIGINAL RR timestamp (`d.sleepRrTsMs.first`, epoch ms),
+/// so mask index `s` maps to absolute second `firstRrSec + s`, then to the hypno
+/// index `firstRrSec + s − sleepOnsetSec` (hypnoStages run per-second from
+/// sleepOnsetSec). Returns null if we lack NN times / RR times / stages (the
+/// estimator then runs unmasked over all sleep windows — still robust, just not
+/// NREM-restricted).
+List<bool>? _nremMaskAlignedToNn(
+  DayBundleInput d,
+  List<double> nnTimes,
+  List<double> nnTimesSrcMs,
+) {
+  if (nnTimes.isEmpty ||
+      nnTimesSrcMs.isEmpty ||
+      d.hypnoStages.isEmpty ||
+      d.sleepOnsetSec == 0) {
+    return null;
+  }
+  // Absolute epoch second of the first NN beat (from the ORIGINAL RR times).
+  final firstRrSec = (nnTimesSrcMs.first / 1000.0).floor();
+  // Span in seconds is measured on the RE-BASED nn time base (starts ~0).
+  final span = (nnTimes.last / 1000.0).floor() + 1;
+  if (span <= 0) return null;
+  final mask = List<bool>.filled(span, false);
+  for (var s = 0; s < span; s++) {
+    final hypnoIdx = (firstRrSec + s) - d.sleepOnsetSec;
+    if (hypnoIdx >= 0 && hypnoIdx < d.hypnoStages.length) {
+      // NREM = Light + Deep in the 4-class stream (was the single 'nrem' label).
+      final lbl = d.hypnoStages[hypnoIdx];
+      mask[s] = lbl == 'light' || lbl == 'deep' || lbl == 'nrem';
+    }
+  }
+  return mask;
+}
+
+/// Day-side HR: the day-span HR samples that fall OUTSIDE the sleep window.
+List<double> _dayHrOutsideSleep(DayBundleInput d) {
+  if (d.sleepOnsetSec == 0 && d.sleepOffsetSec == 0) {
+    return [for (final h in d.dayHr) h.toDouble()];
+  }
+  final out = <double>[];
+  for (var i = 0; i < d.dayHr.length; i++) {
+    final t = d.dayTsSec[i];
+    if (t < d.sleepOnsetSec || t >= d.sleepOffsetSec) {
+      out.add(d.dayHr[i].toDouble());
+    }
+  }
+  return out;
+}
+
+/// Per-minute mean HR over the WAKE span (day minus sleep window), valid only.
+class _WakeMinuteHr {
+  final int tsSec;
+  final double hr;
+  const _WakeMinuteHr(this.tsSec, this.hr);
+}
+
+List<_WakeMinuteHr> _perMinuteWakeSeries(DayBundleInput d) {
+  // Impossible samples are dropped before the minute mean, the same bounds the
+  // engine's `_perMinuteMeanWake` applies: one 245 bpm glitch in a minute of 70s
+  // otherwise lifts that minute by ~3 bpm and bills it as effort.
+  final ceil = hrCeilingForAge((d.profile['age'] as num?)?.round());
+  final buckets = <int, List<double>>{};
+  for (var i = 0; i < d.dayHr.length; i++) {
+    if (d.dayHr[i] < kHrFloorBpm || d.dayHr[i] > ceil) continue;
+    final t = d.dayTsSec[i];
+    if (t >= d.sleepOnsetSec && t < d.sleepOffsetSec) continue; // skip sleep
+    (buckets[t ~/ 60] ??= []).add(d.dayHr[i].toDouble());
+  }
+  final keys = buckets.keys.toList()..sort();
+  return [for (final k in keys) _WakeMinuteHr(k * 60, _meanWelford(buckets[k]!)!)];
+}
+
+Map<String, int> _wakeZoneMinutesFromSeries(
+  List<_WakeMinuteHr> wakeHr,
+  HeartRateZoneSet zoneSet,
+) {
+  final samples = <HrSample>[
+    for (final p in wakeHr) HrSample(p.tsSec * 1000.0, p.hr),
+  ];
+  // Null = no cadence `sampleCadenceSeconds` will vouch for; `const {}` is the
+  // caller's existing absent state (see `hrZones` at its declaration).
+  return HeartRateZones.timeInZone(samples, zoneSet)?.toRoundedMinuteMap() ??
+      const {};
+}
+
+List<Map<String, num>> _zoneTimeline(
+  List<_WakeMinuteHr> wakeHr,
+  HeartRateZoneSet zoneSet,
+) {
+  return [
+    for (final p in wakeHr) {'t': p.tsSec, 'z': zoneSet.zoneNumber(p.hr)},
+  ];
+}
+
+/// The lowest 1-minute median of valid sleep HR and the minute's start.
+({double bpm, int tsSec})? _lowestMinute(List<int> ts, List<int> hr) {
+  final byMin = <int, List<int>>{};
+  for (var i = 0; i < hr.length && i < ts.length; i++) {
+    if (hr[i] >= kHrFloorBpm) (byMin[ts[i] ~/ 60] ??= <int>[]).add(hr[i]);
+  }
+  ({double bpm, int tsSec})? best;
+  for (final e in byMin.entries) {
+    // Half a minute of samples at least, so a lone surviving sample is not a
+    // "minute".
+    if (e.value.length < 30) continue;
+    final v = e.value..sort();
+    final m = v.length.isOdd
+        ? v[v.length ~/ 2].toDouble()
+        : (v[v.length ~/ 2 - 1] + v[v.length ~/ 2]) / 2;
+    if (best == null || m < best.bpm) best = (bpm: m, tsSec: e.key * 60);
+  }
+  return best;
+}
+
+List<Map<String, num>> _strainCurve(
+  List<_WakeMinuteHr> wakeHr, {
+  required double? restingHr,
+  required double? maxHr,
+  required String? sex,
+  required double quietHrr,
+}) {
+  if (wakeHr.isEmpty ||
+      restingHr == null ||
+      maxHr == null ||
+      maxHr <= restingHr ||
+      sex == null) {
+    return const [];
+  }
+  // Banister's sex constants, via the ONE shared weighting factor. This used to
+  // inline `exp(b·hrr)` and drop the 0.64/0.86 scale coefficient entirely, so
+  // the curve accumulated a TRIMP 1.5625× the day's own — the curve and the
+  // headline were never on the same scale. It matters more now: the headline
+  // subtracts a baseline priced with `banisterY`, so a curve accumulating
+  // without it would be netted against an allowance from a different formula.
+  final female = workoutSex(sex) == 'female';
+  final reserve = maxHr - restingHr;
+  var trimp = 0.0;
+  var wakeMin = 0.0;
+  final out = <Map<String, num>>[];
+  for (final p in wakeHr) {
+    var hrr = (p.hr - restingHr) / reserve;
+    if (hrr < 0) hrr = 0;
+    if (hrr > 1) hrr = 1;
+    trimp += hrr * StrainScorer.banisterY(hrr, female: female);
+    // The baseline grows with the wake window ALREADY elapsed, so the curve
+    // stays flat through quiet waking and climbs only on real effort — rather
+    // than charging a whole day's allowance against the first minute.
+    wakeMin += 1;
+    out.add({
+      't': p.tsSec,
+      'v': _round(
+        strainScore(
+          trimp,
+          wakeMinutes: wakeMin,
+          // Reference level, not this user's — see onehz_pipeline's
+          // `strainMetric` for why, and edge#226 for the fix.
+          quietHrr: quietHrr,
+          female: female,
+        ),
+        2,
+      ),
+    });
+  }
+  return out;
+}
+
+/// Welford's online algorithm: returns (mean, stddev) in a single pass.
+/// Used by skinTempAdcHistory at lines 656, 697, 716 — three calls share
+/// one pass instead of three separate passes. Returns null when the input
+/// is empty; variance uses sample denominator (n-1) matching original _stddev.
+({double mean, double stddev})? _welford(List<double> xs) {
+  if (xs.isEmpty) return null;
+  double sum = 0.0;
+  double sumSq = 0.0;
+  for (var i = 0; i < xs.length; i++) {
+    final x = xs[i];
+    sum += x;
+    sumSq += x * x;
+  }
+  final n = xs.length;
+  final mean = sum / n;
+  final stddev = n >= 2
+      ? math.sqrt((sumSq - (sum * sum) / n) / (n - 1))
+      : 0.0;
+  return (mean: mean, stddev: stddev);
+}
+
+/// Cached Welford result per history array identity.
+/// Keys are based on the list's identityHashCode so the same List<double>
+/// object hits the cache after the first pass; different objects get
+/// independent entries. Stored in a top-level map so it persists across
+/// calls within the isolate run.
+final _welfordCache = <int, ({double mean, double stddev})>{};
+
+double? _meanWelford(List<double> xs) {
+  final hc = xs.hashCode;
+  if (_welfordCache.containsKey(hc)) {
+    return _welfordCache[hc]!.mean;
+  }
+  final result = _welford(xs);
+  if (result != null) {
+    _welfordCache[hc] = result;
+  }
+  return result?.mean;
+}
+
+double? _stddevWelford(List<double> xs) {
+  final hc = xs.hashCode;
+  if (_welfordCache.containsKey(hc)) {
+    return _welfordCache[hc]!.stddev;
+  }
+  final result = _welford(xs);
+  if (result != null) {
+    _welfordCache[hc] = result;
+  }
+  return result?.stddev;
+}
+
+double _round(double v, int dp) {
+  final p = math.pow(10, dp);
+  return (v * p).round() / p;
+}
+
+/// HR curve downsampled to ~per-minute {t: epochSec, v: bpm} (valid only).
+List<Map<String, num>> _downsampleHr(List<int> tsSec, List<int> hr) {
+  final buckets = <int, List<double>>{};
+  for (var i = 0; i < hr.length; i++) {
+    if (hr[i] <= 0) continue;
+    final min = tsSec[i] ~/ 60;
+    (buckets[min] ??= []).add(hr[i].toDouble());
+  }
+  final keys = buckets.keys.toList()..sort();
+  return [
+    for (final k in keys) {'t': k * 60, 'v': _meanWelford(buckets[k]!)!.round()},
+  ];
+}
+
+/// HRV timeline: RMSSD over rolling 5-min windows of cleaned NN, {t, v}.
+///
+/// `t` is EPOCH SECONDS. [originMs] is the wall clock at `nnTimes == 0` (see
+/// the call site); with no origin there is no honest x-axis, so nothing is
+/// emitted rather than a curve stamped in 1970.
+List<Map<String, num>> buildHrvTimeline(
+  List<double> nn,
+  List<double> nnTimes,
+  double? originMs,
+) {
+  if (nn.length < 10 || nnTimes.length != nn.length ||
+      originMs == null || !originMs.isFinite) {
+    return const [];
+  }
+  const winMs = 300000.0;
+  // Same recording-gap boundary as the clinical stress/respiration pipeline.
+  const maxGapMs = 30000.0;
+  final out = <Map<String, num>>[];
+  var lo = 0;
+  var segmentStart = 0;
+  var ssd = 0.0;
+  var observedMs = 0.0;
+  var pairs = 0;
+  // Same adjacency rule as analytics hrvTime: after a dropped beat, the
+  // surviving observations are no longer successive NN intervals.
+  bool adjacent(int i) => nnTimes[i] - nnTimes[i - 1] <= nn[i] + .5;
+  for (var i = 0; i < nn.length; i++) {
+    if (!nn[i].isFinite || nn[i] <= 0 || !nnTimes[i].isFinite) {
+      lo = segmentStart = i + 1;
+      ssd = observedMs = 0;
+      pairs = 0;
+      continue;
+    }
+    if (i > segmentStart) {
+      final gap = nnTimes[i] - nnTimes[i - 1];
+      if (gap <= 0 || gap > maxGapMs) {
+        lo = segmentStart = i;
+        ssd = observedMs = 0;
+        pairs = 0;
+      } else {
+        if (adjacent(i)) {
+          final diff = nn[i] - nn[i - 1];
+          ssd += diff * diff;
+          pairs++;
+        }
+        observedMs += math.min(gap, nn[i]);
+      }
+    }
+    while (lo < i && nnTimes[i] - nnTimes[lo] > winMs) {
+      if (adjacent(lo + 1)) {
+        final diff = nn[lo + 1] - nn[lo];
+        ssd -= diff * diff;
+        pairs--;
+      }
+      observedMs -= math.min(nnTimes[lo + 1] - nnTimes[lo], nn[lo + 1]);
+      lo++;
+    }
+    // Restart the five-minute warm-up after a recording break. Retaining a
+    // few beats after a long gap is not a full window. Smaller gaps must still
+    // leave at least 80% observed time; never interpolate missing intervals.
+    if (nnTimes[i] - nnTimes[segmentStart] < winMs ||
+        observedMs < winMs * .8 || pairs < 10) {
+      continue;
+    }
+    final tSec = ((originMs + nnTimes[i]) / 1000).round();
+    if (out.isNotEmpty && tSec - out.last['t']! <= 60) continue;
+    final rmssd = math.sqrt(math.max(0, ssd) / pairs);
+    out.add({'t': tSec, 'v': _round(rmssd, 1)});
+  }
+  return out;
+}
+
+/// Hypnogram segments {start,end,stage} (epoch seconds) from the single-source
+/// per-second stage labels (d.hypnoStages over the sleep window). Display-ready.
+List<Map<String, dynamic>> _hypnogramSegments(DayBundleInput d) {
+  final stages = d.hypnoStages;
+  if (stages.isEmpty || d.sleepOnsetSec == 0) return const [];
+  final t0 = d.sleepOnsetSec;
+  final segs = <Map<String, dynamic>>[];
+  int segStart = 0;
+  String cur = stages.first;
+  for (var i = 1; i < stages.length; i++) {
+    if (stages[i] != cur) {
+      segs.add({'start': t0 + segStart, 'end': t0 + i, 'stage': cur});
+      cur = stages[i];
+      segStart = i;
+    }
+  }
+  segs.add({'start': t0 + segStart, 'end': t0 + stages.length, 'stage': cur});
+  return segs;
+}
+
+/// Whether a 4-class label is SLEEP. `unobserved` is not a stage and not wake —
+/// it is a second the band did not watch, and it belongs to neither side.
+bool _isSleepStage(String s) => s == 'light' || s == 'deep' || s == 'rem';
+
+/// Sustained-awakening threshold. A CHOICE, not physiology: the 3-15 s cortical
+/// arousals PSG counts are invisible to a 1 Hz wrist, so anything shorter than
+/// this we cannot see and anything we do count is a floor, never a total.
+const int kAwakeningMinSec = 300;
+
+/// Run decomposition over the same per-second labels [_hypnogramSegments] uses,
+/// so both readers share one definition of where a run ends.
+///
+/// Returns `{awakenings, longest_sleep_sec, sol_sec}`, each null when it cannot
+/// be said honestly:
+///   * `awakenings` — WAKE runs of ≥ [kAwakeningMinSec] strictly INSIDE the
+///     sleep period (leading/trailing wake is not an awakening).
+///   * `longest_sleep_sec` — the longest unbroken sleep run. Runs TERMINATE at
+///     `unobserved`, never merge across it: bridging a three-hour hole prints a
+///     fabricated five-hour stretch.
+///   * `sol_sec` — seconds from window start to the first sleep second, and ONLY
+///     on a user-forced window. On the auto path the window is built by
+///     `_classifyStill` over gravity, gated on HR-in-band, so it cannot begin
+///     before you are already lying still with a sleep-ish heart rate — the
+///     40-minutes-of-tossing case falls OUTSIDE the window and would report a
+///     latency near zero. Also null when the leading edge is unobserved: we did
+///     not watch you fall asleep.
+Map<String, dynamic> _sleepRuns(DayBundleInput d) {
+  final stages = d.hypnoStages;
+  const absent = {
+    'awakenings': null,
+    'longest_sleep_sec': null,
+    'sol_sec': null,
+  };
+  if (stages.isEmpty) return absent;
+
+  final firstSleep = stages.indexWhere(_isSleepStage);
+  if (firstSleep < 0) return absent; // nothing staged as sleep — no runs
+
+  var lastSleep = stages.length - 1;
+  while (lastSleep > firstSleep && !_isSleepStage(stages[lastSleep])) {
+    lastSleep--;
+  }
+
+  var awakenings = 0, longest = 0, run = 0, wake = 0;
+  for (var i = firstSleep; i <= lastSleep; i++) {
+    final s = stages[i];
+    if (_isSleepStage(s)) {
+      run++;
+      if (run > longest) longest = run;
+      if (wake >= kAwakeningMinSec) awakenings++;
+      wake = 0;
+    } else {
+      run = 0;
+      // Only a WAKE run counts toward an awakening; an unobserved gap breaks
+      // the sleep run (above) but is not evidence that you woke up.
+      wake = s == 'wake' ? wake + 1 : 0;
+    }
+  }
+  // A trailing wake run inside the sleep period is only possible if it is
+  // followed by sleep, which the loop already counted, so nothing to flush.
+
+  final forced = d.sleepSource == 'manual' || d.sleepSource == 'confirmed';
+  final leadingObserved = !stages
+      .sublist(0, firstSleep)
+      .any((s) => s == 'unobserved');
+  return {
+    'awakenings': awakenings,
+    'longest_sleep_sec': longest,
+    'sol_sec': (forced && leadingObserved) ? firstSleep : null,
+  };
+}
+
+/// Baevsky SI → the transparent 0–100 stress score, log-mapped over the
+/// plausible resting SI range [20, 600]. ONE map for the night's score and the
+/// daytime bins, so the two can never disagree about what a given SI means.
+double? _stressScoreOfSi(double si) {
+  if (si <= 0) return null;
+  final lo = math.log(20), hi = math.log(600);
+  return (100 * (math.log(si) - lo) / (hi - lo)).clamp(0.0, 100.0);
+}
+
+/// Daytime stress, the way WHOOP's Stress Monitor reads it: how far the heart
+/// is running above this person's own resting rate while the body is NOT
+/// moving, per 5-minute wall-clock bin, on the same 0–100 scale. Five
+/// minutes, not fifteen, so the day draws as WHOOP's near-continuous line.
+///
+/// Why not [stressPerWindow]: this band sends beat timing densely only while
+/// asleep. Awake it sends a few hundred beats an hour, and the per-bin SI on
+/// that swung 0↔63 between neighbouring bins with no relation to heart rate
+/// (r = −0.08 against bin mean HR on the owner's 21–23 Oct 2026 data). The
+/// 1 Hz heart rate is there every second.
+///
+/// score = (mean HR − resting HR) / (max HR − resting HR) / 0.5 × 100: still
+/// at half of heart-rate reserve is the top of the scale. On the owner's
+/// 23 Oct 2026 data that put sleep at 2–15, desk hours at 85–96 bpm at
+/// 40–58 (medium) and calm evening at 25–35. A "still" bin at 50%+ of reserve
+/// is exercise the band's activity class missed (a 126 bpm bin that day), so
+/// it is treated as movement, not as maximum stress.
+/// ponytail: 0.5 is a fixed reserve fraction, not fitted to WHOOP's stress
+/// export (the owner's export has none); fit it the day one is available.
+///
+/// Each bin carries its length (`sec`), so a reader counts time, not bins.
+/// A bin worn for under two thirds of its length is `score: null`; a bin
+/// where the band saw movement in 30%+ of those seconds, or at 50%+ of
+/// reserve, is `score: null, moving: true` (movement raises heart rate
+/// without stress). Bins with no
+/// heart rate at all are not emitted. No resting or max heart rate, no bins.
+List<Map<String, dynamic>> hrStressPerWindow({
+  required List<int> tsSec,
+  required List<int> hr,
+  List<int> activityClass = const [],
+  required double? restingHr,
+  required double? maxHr,
+  int binSec = 300,
+}) {
+  if (restingHr == null || maxHr == null || !restingHr.isFinite ||
+      !maxHr.isFinite || restingHr <= 0 || maxHr <= restingHr + 20 ||
+      binSec <= 0) {
+    return const [];
+  }
+  if (tsSec.length != hr.length) return const [];
+  final hasActivity = activityClass.length == hr.length;
+  final sum = <int, double>{}, worn = <int, int>{}, moving = <int, int>{};
+  final seenSeconds = <int>{};
+  for (var i = 0; i < hr.length; i++) {
+    if (hr[i] <= 0 || !seenSeconds.add(tsSec[i])) continue;
+    final k = tsSec[i] ~/ binSec;
+    sum[k] = (sum[k] ?? 0) + hr[i];
+    worn[k] = (worn[k] ?? 0) + 1;
+    if (hasActivity && activityClass[i] >= 1) moving[k] = (moving[k] ?? 0) + 1;
+  }
+  final keys = worn.keys.toList()..sort();
+  return [
+    for (final k in keys)
+      () {
+        final n = worn[k]!;
+        final t = k * binSec;
+        if (n < binSec * 2 ~/ 3) {
+          return <String, dynamic>{'t': t, 'sec': binSec, 'score': null};
+        }
+        final f = (sum[k]! / n - restingHr) / (maxHr - restingHr);
+        if ((moving[k] ?? 0) >= 0.3 * n || f >= 0.5) {
+          return <String, dynamic>{
+            't': t,
+            'sec': binSec,
+            'score': null,
+            'moving': true,
+          };
+        }
+        return <String, dynamic>{
+          't': t,
+          'sec': binSec,
+          'score': _round((f / 0.5).clamp(0.0, 1.0) * 100, 1),
+        };
+      }(),
+  ];
+}
+
+/// Daytime stress: the SAME [baevskyStressIndex] the night uses, run over each
+/// 15-minute wall-clock bin of the whole-day cleaned NN, scored with the same
+/// [_stressScoreOfSi]. Orchestration only — no new metric.
+///
+/// A bin with too few clean beats for one SI window, or whose windows all fail
+/// the quantization guard, is `score: null` — never interpolated from its
+/// neighbours. Bins with no beats at all are not emitted, so a gap in wear
+/// stays a gap. `t` is the bin start in epoch seconds.
+List<Map<String, dynamic>> stressPerWindow(
+  List<double> nn,
+  List<double> nnTimes,
+  double epochOffsetMs, {
+  double windowMs = 900000.0,
+  int minBeats = 256,
+}) {
+  if (nn.isEmpty || nn.length != nnTimes.length) return const [];
+  final binsNn = <int, List<double>>{};
+  final binsTs = <int, List<double>>{};
+  for (var i = 0; i < nn.length; i++) {
+    final idx = ((nnTimes[i] + epochOffsetMs) / windowMs).floor();
+    (binsNn[idx] ??= <double>[]).add(nn[i]);
+    (binsTs[idx] ??= <double>[]).add(nnTimes[i]);
+  }
+  final keys = binsNn.keys.toList()..sort();
+  return [
+    for (final k in keys)
+      () {
+        final bin = binsNn[k]!;
+        final m = bin.length >= minBeats
+            ? baevskyStressIndex(bin, nnTimesMs: binsTs[k])
+            : null;
+        final score = m != null && m.present ? _stressScoreOfSi(m.value!.si) : null;
+        return <String, dynamic>{
+          't': (k * windowMs / 1000).round(),
+          'score': score == null ? null : _round(score, 1),
+        };
+      }(),
+  ];
+}
