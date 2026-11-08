@@ -517,7 +517,7 @@ dependencies:
 
   # Local raw-first storage.
   sqflite: ^2.4.1
-  sqflite_common_ffi: ^2.5.0
+  sqflite_common_ffi: ^2.4.0
   # SQLCipher for encrypted SQLite database at rest. Health data requires
   # encryption by default. The passphrase is derived from device credentials
   # or a user-configured PIN (see db.dart's _encryptionKey()).
