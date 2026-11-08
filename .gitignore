@@ -136,3 +136,17 @@ replica/
 /work/
 *.p12
 *.mobileprovision
+source/work/*.db
+
+# Private local source staging and recordings must never be published.
+/source/
+**/work/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.pfx
+*.keystore
