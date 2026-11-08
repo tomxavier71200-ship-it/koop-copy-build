@@ -20,7 +20,8 @@ import 'package:openstrap_protocol/openstrap_protocol.dart' as proto;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
-import 'package:sqlcipher/sqlcipher.dart';
+import 'package:sqflite_sqlcipher/sqflite.dart' as cipher;
+import 'dart:math' show Random;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../compute/substrate.dart' show beatTimesMs;
@@ -188,21 +189,14 @@ class LocalDb {
     String? key = await _secureStorage.read(key: _encryptionKeyKey);
     if (key == null) {
       // Generate a new 256-bit (32-byte) key
-      final bytes = Uint8List(32);
-      final random = DateTime.now().millisecondsSinceEpoch;
-      for (int i = 0; i < 32; i++) {
-        bytes[i] = (random >> (i % 8)) ^ (i * 31) ^ (random & 0xFF);
-      }
+      final random = Random.secure();
+      final bytes = Uint8List.fromList(
+        List<int>.generate(32, (_) => random.nextInt(256)),
+      );
       key = base64Encode(bytes);
       await _secureStorage.write(key: _encryptionKeyKey, value: key);
     }
     return key;
-  }
-
-  /// Gets the encryption key as bytes for SQLCipher
-  static Future<Uint8List> _getEncryptionKeyBytes() async {
-    final key = await _getOrCreateEncryptionKey();
-    return base64Decode(key);
   }
 
   /// Set when [_openOrRebuild] had to quarantine an unopenable database and
@@ -460,9 +454,9 @@ class LocalDb {
     final path = p.join(dir, dbName);
 
     // Get encryption key for SQLCipher
-    final encryptionKey = await _getEncryptionKeyBytes();
+    final encryptionKey = await _getOrCreateEncryptionKey();
 
-    return openDatabase(
+    return cipher.openDatabase(
       path,
       password: encryptionKey,
       onConfigure: (db) async {
