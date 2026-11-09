@@ -71,13 +71,9 @@ android {
         versionCode = flutter.versionCode
         versionName = flutter.versionName
 
-        // Retain FULL native debug symbols in the release bundle so Play Console
-        // AND Crashlytics can symbolicate native/ANR frames. Without this, ANRs
-        // sampled in native code (e.g. libm.so __kernel_rem_pio2 / sin / cos, and
-        // the Dart AOT frames in libapp.so) show up as raw addresses / blank
-        // frames with "root cause unknown" — which is exactly why the v42 staging
-        // ANRs on 0.9.13 were unsymbolicated and hard to triage.
+        // ABI filters for sideload build - reduce APK size
         ndk {
+            abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a"))
             debugSymbolLevel = "FULL"
         }
     }
@@ -95,9 +91,6 @@ android {
             storePassword = signingValue("storePassword", "ANDROID_KEYSTORE_PASSWORD") ?: "android"
             keyAlias = signingValue("keyAlias", "ANDROID_KEY_ALIAS") ?: "androiddebugkey"
             keyPassword = signingValue("keyPassword", "ANDROID_KEY_PASSWORD") ?: "android"
-            // Enforce RSA 256 for sideload compliancy on API 30+ devices.
-            sigalg = "SHA256withRSA"
-            digestalg = "SHA256"
         }
     }
 
@@ -145,7 +138,6 @@ dependencies {
     // runtime transitively, but as an `implementation` dep it isn't visible to app
     // code at compile time — declare it explicitly for our native Worker.
     implementation("androidx.work:work-runtime-ktx:2.9.1")
-    // SQLCipher for encrypted SQLite database
-    implementation("net.zetetic:android-database-sqlcipher:4.6.0@aar")
+    // SQLCipher for encrypted SQLite database - provided by sqflite_sqlcipher package
     testImplementation("junit:junit:4.13.2")
 }

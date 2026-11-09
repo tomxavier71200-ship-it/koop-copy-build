@@ -4,8 +4,7 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        // SQLCipher for Android - required for encrypted SQLite
-        classpath("net.zetetic:android-database-sqlcipher:4.6.0@aar")
+        // SQLCipher is now provided by sqflite_sqlcipher package
     }
 }
 
