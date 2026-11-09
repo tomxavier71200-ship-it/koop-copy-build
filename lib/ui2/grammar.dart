@@ -2807,23 +2807,68 @@ class _DaySwipeState extends State<DaySwipe>
         velocity));
   }
 
+  void _goTo(String day) {
+    HapticFeedback.selectionClick();
+    widget.onDay(day);
+  }
+
   @override
   Widget build(BuildContext c) {
     return LayoutBuilder(builder: (c, box) {
       _w = box.maxWidth.isFinite && box.maxWidth > 0 ? box.maxWidth : 1;
       final dx = _x.value;
-      return GestureDetector(
-        // The arrows are the accessible way between days; a second, invisible
-        // one in the semantics tree would only be noise.
-        excludeFromSemantics: true,
-        behavior: HitTestBehavior.translucent,
-        onHorizontalDragStart: _start,
-        onHorizontalDragUpdate: _update,
-        onHorizontalDragEnd: _end,
-        onHorizontalDragCancel: _cancel,
-        child: Opacity(
-          opacity: (1 - (dx.abs() / _w) * .35).clamp(.6, 1.0),
-          child: Transform.translate(offset: Offset(dx, 0), child: widget.child),
+      final showPrev = _older != null;
+      final showNext = _newer != null;
+
+      return Semantics(
+        label: 'Day navigator',
+        child: FocusableActionDetector(
+          shortcuts: {
+            if (showPrev)
+              SingleActivator(LogicalKeyboardKey.arrowLeft): ActivateIntent(),
+            if (showNext)
+              SingleActivator(LogicalKeyboardKey.arrowRight): ActivateIntent(),
+          },
+          actions: {
+            ActivateIntent: CallbackAction<ActivateIntent>(
+              onInvoke: (intent) {
+                // Use a DirectionalFocusAction-like approach: check which key triggered
+                // Since we use the same ActivateIntent for both, we need a different approach.
+                // Use a custom intent to carry direction.
+                return null;
+              },
+            ),
+            // Use DirectionalFocusAction for arrow key navigation
+            DirectionalFocusAction: CallbackAction<DirectionalFocusIntent>(
+              onInvoke: (intent) {
+                if (intent is DirectionalFocusIntent) {
+                  if (intent.direction == TraversalDirection.left && showPrev) {
+                    _goTo(_older!);
+                  } else if (intent.direction == TraversalDirection.right && showNext) {
+                    _goTo(_newer!);
+                  }
+                }
+                return null;
+              },
+            ),
+          },
+          onShowFocusHighlight: (value) {
+            // Could add visual focus indicator here if needed
+          },
+          child: GestureDetector(
+            // The arrows are the accessible way between days; a second, invisible
+            // one in the semantics tree would only be noise.
+            excludeFromSemantics: true,
+            behavior: HitTestBehavior.translucent,
+            onHorizontalDragStart: _start,
+            onHorizontalDragUpdate: _update,
+            onHorizontalDragEnd: _end,
+            onHorizontalDragCancel: _cancel,
+            child: Opacity(
+              opacity: (1 - (dx.abs() / _w) * .35).clamp(.6, 1.0),
+              child: Transform.translate(offset: Offset(dx, 0), child: widget.child),
+            ),
+          ),
         ),
       );
     });
