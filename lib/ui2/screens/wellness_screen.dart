@@ -1036,6 +1036,7 @@ class _WellnessScreenState extends State<WellnessScreen> with RevisionReload {
             controller: ctrl,
             label: l?.wellnessNameLabel ?? 'Name',
             hint: hint,
+            autofillHints: const [AutofillHints.name],
           ),
           actions: [
             TextButton(

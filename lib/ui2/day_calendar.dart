@@ -191,7 +191,15 @@ class _DayCalendarState extends State<DayCalendar> {
         ),
       ),
     ]);
-    if (!has) return ExcludeSemantics(child: body);
+    if (!has) {
+      // Days without data should still be focusable for keyboard navigation
+      // but not actionable. Use Semantics with enabled=false.
+      return Semantics(
+        label: '${date.day} ${_months[date.month - 1]}, no data',
+        enabled: false,
+        child: body,
+      );
+    }
     return Pressable(
       onTap: () => widget.onDay(id),
       semanticLabel: '${date.day} ${_months[date.month - 1]}',

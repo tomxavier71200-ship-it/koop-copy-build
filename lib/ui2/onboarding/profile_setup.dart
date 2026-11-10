@@ -177,15 +177,18 @@ class _ProfileSetupViewState extends State<ProfileSetupView> {
             _Field(_age, l?.profileSetupAgeLabel ?? 'AGE',
                 l?.profileSetupAgeUnit ?? 'years',
                 l?.profileSetupAgeConsequence ??
-                    'Without it: heart-rate zones, calories, fitness age.'),
+                    'Without it: heart-rate zones, calories, fitness age.',
+                autofillHints: const [AutofillHints.birthdayDay]),
             _Field(_height, l?.profileSetupHeightLabel ?? 'HEIGHT',
                 _u.isImperial ? 'in' : 'cm',
                 l?.profileSetupHeightConsequence ??
-                    'Without it: stride length, and distance from steps.'),
+                    'Without it: stride length, and distance from steps.',
+                autofillHints: const [AutofillHints.streetAddressLine1]),
             _Field(_weight, l?.profileSetupWeightLabel ?? 'WEIGHT',
                 _u.isImperial ? 'lb' : 'kg',
                 l?.profileSetupWeightConsequence ??
-                    'Without it: calories and training load.'),
+                    'Without it: calories and training load.',
+                autofillHints: const [AutofillHints.creditCardNumber]),
             const SizedBox(height: S.x5),
             BigButton(l?.actionContinue ?? 'Continue',
                 color: C.green, onTap: _sex == null ? null : _continue),
@@ -236,7 +239,8 @@ class _Choice extends StatelessWidget {
 class _Field extends StatelessWidget {
   final TextEditingController controller;
   final String label, unit, consequence;
-  const _Field(this.controller, this.label, this.unit, this.consequence);
+  final List<String>? autofillHints;
+  const _Field(this.controller, this.label, this.unit, this.consequence, {this.autofillHints});
 
   @override
   Widget build(BuildContext c) {
@@ -253,6 +257,7 @@ class _Field extends StatelessWidget {
         TextField(
           controller: controller,
           keyboardType: TextInputType.number,
+          autofillHints: autofillHints,
           style: F.head.copyWith(color: p.ink),
           decoration: InputDecoration(
             hintText: unit,

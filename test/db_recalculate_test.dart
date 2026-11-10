@@ -3,9 +3,8 @@
 import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
-
-import '../lib/compute/derivation_engine.dart' show kAlgorithmVersion;
-import '../lib/data/db_recalculate.dart';
+import 'package:openstrap_edge/compute/derivation_engine.dart' show kAlgorithmVersion;
+import 'package:openstrap_edge/data/db_recalculate.dart';
 
 void main() {
   group('Database Recalculation System', () {

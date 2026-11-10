@@ -2308,7 +2308,11 @@ class ChartFrame extends StatelessWidget {
           // Title and unit share a line until the text scale makes that a
           // choice between truncating the title and dropping the unit — at
           // which point the unit moves under it. Neither is ever dropped.
-          ExcludeSemantics(child: _header(p, scaler.scale(1) > 1.3)),
+          Semantics(
+            label: '',
+            excludeSemantics: true,
+            child: _header(p, scaler.scale(1) > 1.3),
+          ),
           const SizedBox(height: S.x3),
 
           // ── plot, or the honest absence of one ──
@@ -2325,7 +2329,9 @@ class ChartFrame extends StatelessWidget {
                 children: [
                   if (a != null) ...[
                     // Tick numbers, spoken already as part of the frame's sentence.
-                    ExcludeSemantics(
+                    Semantics(
+                      label: '',
+                      excludeSemantics: true,
                       child: SizedBox(
                         width: gutter,
                         child: Stack(
@@ -2385,7 +2391,9 @@ class ChartFrame extends StatelessWidget {
 
           // ── x axis ──
           if (empty == null && xLabels.isNotEmpty)
-            ExcludeSemantics(
+            Semantics(
+              label: '',
+              excludeSemantics: true,
               child: Padding(
                 padding: EdgeInsets.only(top: S.x1, left: inset),
                 child: Row(
@@ -2411,7 +2419,9 @@ class ChartFrame extends StatelessWidget {
 
           // ── legend ──
           if (legend.isNotEmpty)
-            ExcludeSemantics(
+            Semantics(
+              label: '',
+              excludeSemantics: true,
               child: Padding(
                 padding: const EdgeInsets.only(top: S.x3),
                 child: Wrap(
@@ -2447,7 +2457,9 @@ class ChartFrame extends StatelessWidget {
             ),
 
           if (footnote != null)
-            ExcludeSemantics(
+            Semantics(
+              label: '',
+              excludeSemantics: true,
               child: Padding(
                 padding: const EdgeInsets.only(top: S.x2),
                 child: Text(footnote!, style: F.cap.copyWith(color: p.ink3)),

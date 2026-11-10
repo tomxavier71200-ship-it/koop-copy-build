@@ -103,6 +103,7 @@ class _ActivityPickerState extends State<ActivityPicker> {
                     textField: true,
                     child: TextField(
                       autofocus: true,
+                      autofillHints: const [AutofillHints.name],
                       onChanged: (v) => setState(() => q = v),
                       style: F.body.copyWith(color: p.ink),
                       cursorColor: p.on(C.purple),

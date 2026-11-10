@@ -197,6 +197,7 @@ class _PassphraseDialogState extends State<_PassphraseDialog> {
           controller: _a,
           obscureText: true,
           autofocus: true,
+          autofillHints: const [AutofillHints.password],
           decoration: InputDecoration(
               labelText: l?.welcomePassphrase ?? 'Passphrase'),
           onSubmitted: creating ? null : (_) => _submit(),
@@ -206,6 +207,7 @@ class _PassphraseDialogState extends State<_PassphraseDialog> {
           TextField(
             controller: _b,
             obscureText: true,
+            autofillHints: const [AutofillHints.newPassword],
             decoration: InputDecoration(
                 labelText: l?.welcomeRepeatIt ?? 'Repeat it'),
             onSubmitted: (_) => _submit(),

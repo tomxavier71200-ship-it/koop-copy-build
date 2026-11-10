@@ -1560,7 +1560,8 @@ class _EditProfileViewState extends State<EditProfileView> {
               padding: const EdgeInsets.fromLTRB(S.x4, 0, S.x4, S.x10),
               children: [
                 _text(c, _name, l?.settingsNameFieldLabel ?? 'NAME',
-                    TextInputType.name),
+                    TextInputType.name,
+                    autofillHints: const [AutofillHints.name]),
                 const SizedBox(height: S.x4),
                 Text(l?.settingsSexFieldLabel ?? 'SEX',
                     style: F.over.copyWith(color: p.ink3)),
@@ -1592,7 +1593,8 @@ class _EditProfileViewState extends State<EditProfileView> {
                 ]),
                 const SizedBox(height: S.x4),
                 _text(c, _age, l?.settingsAgeYearsFieldLabel ?? 'AGE (YEARS)',
-                    TextInputType.number),
+                    TextInputType.number,
+                    autofillHints: const [AutofillHints.birthday]),
                 const SizedBox(height: S.x4),
                 _text(c, _height, _u.heightLabel.toUpperCase(),
                     TextInputType.number),
@@ -1662,7 +1664,7 @@ class _EditProfileViewState extends State<EditProfileView> {
   }
 
   Widget _text(BuildContext c, TextEditingController ctl, String label,
-      TextInputType kind) {
+      TextInputType kind, {List<String>? autofillHints}) {
     final p = P.of(c);
     final l = AppLocalizations.of(c);
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1670,6 +1672,7 @@ class _EditProfileViewState extends State<EditProfileView> {
       TextField(
         controller: ctl,
         keyboardType: kind,
+        autofillHints: autofillHints,
         style: F.head.copyWith(color: p.ink),
         decoration: InputDecoration(
           hintText: l?.settingsNotSetHint ?? 'Not set',

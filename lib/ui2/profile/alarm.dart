@@ -623,6 +623,7 @@ class _AlarmSetEditorState extends State<AlarmSetEditor> {
                   child: TextField(
                     controller: _name,
                     style: F.head.copyWith(color: p.ink),
+                    autofillHints: const [AutofillHints.name],
                     decoration: InputDecoration(
                         labelText: 'NAME',
                         labelStyle: F.over.copyWith(color: p.ink3),

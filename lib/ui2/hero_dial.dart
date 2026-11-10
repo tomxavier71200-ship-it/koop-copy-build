@@ -98,7 +98,8 @@ class HeroDial extends StatelessWidget {
                         children: [
                           // The thin, wide-spaced wordmark above the number, where
                           // WHOOP prints its own name.
-                          ExcludeSemantics(
+                          Semantics(
+                            label: 'Koop',
                             child: Text(
                               'KOOP',
                               style: F

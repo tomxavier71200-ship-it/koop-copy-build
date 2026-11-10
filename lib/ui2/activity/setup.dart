@@ -150,39 +150,37 @@ class _ActivitySetupState extends State<ActivitySetup> {
                             : on
                                 ? 'Band connected'
                                 : 'Band disconnected',
-                        child: ExcludeSemantics(
-                          child: Container(
-                            width: 200,
-                            height: 200,
-                            decoration: BoxDecoration(
-                                color: on ? p.on(C.strain) : p.card2,
-                                shape: BoxShape.circle),
-                            child: Column(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Icon(LucideIcons.heart,
-                                      size: 30, color: on ? p.bg : p.ink3),
-                                  const SizedBox(height: S.x2),
-                                  FittedBox(
-                                    fit: BoxFit.scaleDown,
-                                    child: Text(
-                                        hr != null
-                                            ? '$hr'
-                                            : on
-                                                ? 'CONNECTED'
-                                                : 'DISCONNECTED',
-                                        style: (hr != null ? F.n48 : F.label)
-                                            .copyWith(
-                                                color: on ? p.bg : p.ink2,
-                                                letterSpacing: hr != null ? 0 : 1.6,
-                                                fontWeight: FontWeight.w700)),
-                                  ),
-                                  if (hr != null)
-                                    Text('BPM',
-                                        style: F.over.copyWith(color: p.bg)),
-                                ]),
-                          ),
-                        ),
+                        child: Container(
+                        width: 200,
+                        height: 200,
+                        decoration: BoxDecoration(
+                            color: on ? p.on(C.strain) : p.card2,
+                            shape: BoxShape.circle),
+                        child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(LucideIcons.heart,
+                                  size: 30, color: on ? p.bg : p.ink3),
+                              const SizedBox(height: S.x2),
+                              FittedBox(
+                                fit: BoxFit.scaleDown,
+                                child: Text(
+                                    hr != null
+                                        ? '$hr'
+                                        : on
+                                            ? 'CONNECTED'
+                                            : 'DISCONNECTED',
+                                    style: (hr != null ? F.n48 : F.label)
+                                        .copyWith(
+                                            color: on ? p.bg : p.ink2,
+                                            letterSpacing: hr != null ? 0 : 1.6,
+                                            fontWeight: FontWeight.w700)),
+                              ),
+                              if (hr != null)
+                                Text('BPM',
+                                    style: F.over.copyWith(color: p.bg)),
+                            ]),
+                      ),
                       );
                     }),
                     const SizedBox(height: S.x1),

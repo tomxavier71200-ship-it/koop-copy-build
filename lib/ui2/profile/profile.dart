@@ -97,7 +97,10 @@ class SetRow extends StatelessWidget {
       builder: (c, constraints) {
         final stackValue = bigText(c) || constraints.maxWidth < S.tap * 7;
         final stackToggle = toggleValue != null && stackValue;
-        Widget toggle() => ExcludeSemantics(
+        Widget toggle() => Semantics(
+          label: title,
+          button: true,
+          enabled: onTap != null,
           child: Switch.adaptive(
             value: toggleValue!,
             activeTrackColor: p.fill(accent),
@@ -188,13 +191,18 @@ class SetRow extends StatelessWidget {
       },
     );
     if (toggleValue == null) return row;
+    // Merge the Pressable and Switch into a single toggle node for a11y.
+    // The Switch is the control; the Pressable label is the description.
+    // ExcludeSemantics on the Pressable hides the interactive child from screen readers.
+    // Instead, wrap the Pressable in Semantics with toggled/enabled and let the
+    // Switch remain reachable. The Pressable's onTap already toggles.
     return Semantics(
       container: true,
       label: label,
       toggled: toggleValue,
       enabled: onTap != null,
       onTap: onTap,
-      child: ExcludeSemantics(child: row),
+      child: row,
     );
   }
 }

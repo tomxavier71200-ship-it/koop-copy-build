@@ -466,13 +466,15 @@ class _LogFoodSheetState extends State<LogFoodSheet> {
                 controller: _label,
                 label: l?.logFoodWhatLabel ?? 'What',
                 hint: l?.logFoodWhatHint ?? 'Chicken and rice',
+                autofillHints: const [AutofillHints.name],
               ),
               if (_scanned != null) ...[
                 const SizedBox(height: S.x4),
                 _NumberRow(
                   fields: [(l?.logFoodPortionLabel ?? 'Portion', 'g', _portion)],
                   hint: '100',
-                ),
+                  autofillHints: const [],
+                                  ),
                 const SizedBox(height: S.x2),
                 Text(
                   _portionNote(c, _scanned!),
@@ -486,7 +488,8 @@ class _LogFoodSheetState extends State<LogFoodSheet> {
                   (l?.logFoodProteinLabel ?? 'Protein', 'g', _protein),
                 ],
                 hint: l?.logFoodUnknownHint ?? 'unknown',
-              ),
+                autofillHints: const [],
+                              ),
               const SizedBox(height: S.x4),
               _NumberRow(
                 fields: [
@@ -494,14 +497,16 @@ class _LogFoodSheetState extends State<LogFoodSheet> {
                   (l?.logFoodFatLabel ?? 'Fat', 'g', _fat),
                 ],
                 hint: l?.logFoodUnknownHint ?? 'unknown',
-              ),
+                autofillHints: const [],
+                              ),
               const SizedBox(height: S.x4),
               // The week card has always averaged fibre; nothing could enter
               // it, so the row read "Not recorded" forever.
               _NumberRow(
                 fields: [(l?.logFoodFibreLabel ?? 'Fibre', 'g', _fibre)],
                 hint: l?.logFoodUnknownHint ?? 'unknown',
-              ),
+                autofillHints: const [],
+                              ),
               const SizedBox(height: S.x3),
               Text(
                 l?.logFoodBlankHint ??
@@ -799,9 +804,14 @@ class FoodRow extends StatelessWidget {
 }
 
 class _NumberRow extends StatelessWidget {
-  const _NumberRow({required this.fields, this.hint = 'unknown'});
+  const _NumberRow({
+    required this.fields,
+    this.hint = 'unknown',
+    this.autofillHints,
+  });
   final List<(String, String, TextEditingController)> fields;
   final String hint;
+  final List<String>? autofillHints;
 
   @override
   Widget build(BuildContext c) => Row(
@@ -814,6 +824,7 @@ class _NumberRow extends StatelessWidget {
             label: '${fields[i].$1} (${fields[i].$2})',
             hint: hint,
             keyboard: const TextInputType.numberWithOptions(decimal: true),
+            autofillHints: autofillHints,
           ),
         ),
         if (i < fields.length - 1) const SizedBox(width: S.x3),

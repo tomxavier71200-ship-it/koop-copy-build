@@ -336,6 +336,7 @@ class _JournalComposeState extends State<JournalCompose> {
                           hint: l?.journalComposeAnythingElseHint ??
                               'A line about the day.',
                           lines: 4,
+                          autofillHints: const [AutofillHints.name],
                         ),
                         const SizedBox(height: S.x6),
                         BigButton(
@@ -572,6 +573,7 @@ class OsTextField extends StatelessWidget {
     this.hint = '',
     this.lines = 1,
     this.keyboard,
+    this.autofillHints,
   });
 
   final TextEditingController controller;
@@ -579,6 +581,7 @@ class OsTextField extends StatelessWidget {
   final String hint;
   final int lines;
   final TextInputType? keyboard;
+  final List<String>? autofillHints;
 
   @override
   Widget build(BuildContext c) {
@@ -607,6 +610,7 @@ class OsTextField extends StatelessWidget {
               maxLines: lines,
               minLines: 1,
               keyboardType: keyboard,
+              autofillHints: autofillHints,
               style: F.body.copyWith(color: p.ink),
               cursorColor: p.on(C.domMind),
               decoration: InputDecoration(
@@ -753,6 +757,7 @@ class _WeightRow extends StatelessWidget {
               label: u?.weightLabel ?? (l?.journalComposeWeightKgLabel ?? 'Weight (kg)'),
               hint: imperial ? '154' : '70.0',
               keyboard: const TextInputType.numberWithOptions(decimal: true),
+              autofillHints: const [AutofillHints.creditCardNumber], // weight is personal data
             ),
             const SizedBox(height: S.x3),
             Text(
