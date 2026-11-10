@@ -1,0 +1,232 @@
+name: iOS TestFlight / App Store Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'testflight'
+        type: choice
+        options:
+          - testflight
+          - appstore
+  push:
+    branches: ['release/*', 'main']
+    tags: ['v*']
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: ios-testflight-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-testflight:
+    name: Build and upload to TestFlight
+    if: ${{ github.event.inputs.build_type != 'appstore' || github.ref_type == 'tag' }}
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      FLUTTER_VERSION: '3.41.6'
+      XCODE_VERSION: '16.1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+
+      - name: Install Fastlane
+        run: |
+          gem install fastlane -v 2.225.0 --no-document
+
+      - name: Configure KOOP COPY Identity
+        run: |
+          cat > ios/Config/Signing.xcconfig <<'EOF'
+          APP_BUNDLE_IDENTIFIER = wtf.openstrap.koopcopy
+          APP_WIDGET_BUNDLE_IDENTIFIER = wtf.openstrap.koopcopy.OpenStrapWidget
+          APP_GROUP_IDENTIFIER = group.wtf.openstrap.koopcopy
+          EOF
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName KOOP COPY' ios/Runner/Info.plist
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleName KOOP COPY' ios/Runner/Info.plist
+
+      - name: Write Environment File
+        run: |
+          echo "COMPANION_URL=" > .env
+          echo "BACKEND_URL=" >> .env
+
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: Install FlutterFire
+        run: dart pub global activate flutterfire_cli 1.4.0
+
+      - name: Remove Watch Target (cannot re-sign with free Apple ID)
+        run: ruby .github/scripts/remove_watch_target.rb
+
+      - name: Configure Match (Fastlane)
+        env:
+          MATCH_GIT_URL: ${{ secrets.MATCH_GIT_URL }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          MATCH_KEYCHAIN_NAME: ${{ secrets.MATCH_KEYCHAIN_NAME }}
+          MATCH_KEYCHAIN_PASSWORD: ${{ secrets.MATCH_KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+        run: |
+          # Create Fastlane directory if needed
+          mkdir -p ios/fastlane
+
+          # Configure Match for certificate management
+          cat > ios/fastlane/Matchfile <<'MATCHFILE_EOF'
+          git_url(ENV["MATCH_GIT_URL"])
+          storage_mode("git")
+          type("appstore")
+          keychain_name(ENV["MATCH_KEYCHAIN_NAME"])
+          keychain_password(ENV["MATCH_KEYCHAIN_PASSWORD"])
+          team_id(ENV["TEAM_ID"])
+          MATCHFILE_EOF
+
+          # Run match to sync certificates
+          cd ios && bundle exec fastlane match appstore --readonly || bundle exec fastlane match appstore
+
+      - name: Build iOS App (Release, Signed)
+        env:
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+        run: |
+          cd ios
+          # Build with proper signing
+          flutter build ipa \
+            --release \
+            --dart-define-from-file=../.env \
+            --build-name=0.10.${{ github.run_number }} \
+            --build-number=${{ github.run_number }} \
+            --export-options-plist=ExportOptions.plist
+          cd ..
+
+      - name: Upload to TestFlight
+        if: ${{ github.event.inputs.build_type == 'testflight' || github.ref_type != 'tag' }}
+        env:
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+        run: |
+          cd ios
+          bundle exec fastlane pilot upload \
+            ipa:../build/ios/ipa/Runner.ipa \
+            api_key:../app_store_connect_api_key.json \
+            skip_waiting_for_build_processing:true \
+            changelog:"Build ${{ github.run_number }} from ${{ github.sha }}"
+          cd ..
+
+      - name: Upload to App Store Connect
+        if: ${{ github.event.inputs.build_type == 'appstore' && github.ref_type == 'tag' }}
+        env:
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+        run: |
+          cd ios
+          bundle exec fastlane deliver \
+            ipa:../build/ios/ipa/Runner.ipa \
+            api_key:../app_store_connect_api_key.json \
+            skip_metadata:true \
+            skip_screenshots:true \
+            force:true \
+            run_precheck_before_submit:false
+          cd ..
+
+      - name: Create GitHub Release
+        if: ${{ github.ref_type == 'tag' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/ios/ipa/Runner.ipa
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-sideload:
+    name: Build Sideload (Unsigned) IPA
+    if: ${{ github.event.inputs.build_type != 'appstore' }}
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.6'
+
+      - name: Configure KOOP COPY Identity
+        run: |
+          cat > ios/Config/Signing.xcconfig <<'EOF'
+          APP_BUNDLE_IDENTIFIER = wtf.openstrap.koopcopy
+          APP_WIDGET_BUNDLE_IDENTIFIER = wtf.openstrap.koopcopy.OpenStrapWidget
+          APP_GROUP_IDENTIFIER = group.wtf.openstrap.koopcopy
+          EOF
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName KOOP COPY' ios/Runner/Info.plist
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleName KOOP COPY' ios/Runner/Info.plist
+
+      - name: Write blank .env
+        run: |
+          echo "COMPANION_URL=" > .env
+          echo "BACKEND_URL=" >> .env
+
+      - name: Install flutterfire
+        run: dart pub global activate flutterfire_cli 1.4.0
+
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: Exclude Watch companion from sideload build
+        run: ruby .github/scripts/remove_watch_target.rb
+
+      - name: Build unsigned iOS app
+        run: |
+          flutter build ios --release --no-codesign --dart-define-from-file=.env \
+            --build-name=0.10.${{ github.run_number }} \
+            --build-number=${{ github.run_number }}
+
+      - name: Sign with ldid for SideStore
+        run: |
+          brew install ldid
+          app=build/ios/iphoneos/Runner.app
+          find "$app/PlugIns" -mindepth 1 -maxdepth 1 ! -name 'OpenStrapWidgetExtension.appex' -exec rm -rf {} +
+          cat > ent.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>com.apple.security.application-groups</key>
+            <array><string>group.wtf.openstrap.koopcopy</string></array>
+          </dict></plist>
+          EOF
+          appex="$app/PlugIns/OpenStrapWidgetExtension.appex"
+          if [ -d "$appex" ]; then
+            ldid -Sent.plist "$appex/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$appex/Info.plist")"
+          fi
+          cp ent.plist app-ent.plist
+          /usr/libexec/PlistBuddy -c "Add :com.apple.developer.healthkit bool true" \
+            -c "Add :com.apple.developer.healthkit.access array" app-ent.plist
+          ldid -Sapp-ent.plist "$app/Runner"
+          ldid -e "$app/Runner"
+
+      - name: Package unsigned IPA
+        run: |
+          cd build/ios/iphoneos
+          mkdir -p Payload
+          cp -R Runner.app Payload/Runner.app
+          zip -qr -y "$GITHUB_WORKSPACE/koop-copy-unsigned.ipa" Payload
+
+      - name: Upload Sideload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: koop-copy-sideload-ipa
+          path: koop-copy-unsigned.ipa
+          retention-days: 14

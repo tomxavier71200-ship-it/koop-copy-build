@@ -1,0 +1,102 @@
+default_platform(:ios)
+
+platform :ios do
+  before_all do
+    setup_ci if ENV['CI']
+    # Create keychain for match if needed
+    create_keychain(
+      name: ENV["MATCH_KEYCHAIN_NAME"],
+      password: ENV["MATCH_KEYCHAIN_PASSWORD"],
+      default_keychain: true,
+      unlock: true,
+      timeout: 3600,
+      lock_when_sleeps: false
+    ) if ENV["MATCH_KEYCHAIN_NAME"]
+  end
+
+  desc "Sync certificates with Match"
+  lane :sync_certificates do
+    match(
+      type: "appstore",
+      readonly: false,
+      git_url: ENV["MATCH_GIT_URL"],
+      keychain_name: ENV["MATCH_KEYCHAIN_NAME"],
+      keychain_password: ENV["MATCH_KEYCHAIN_PASSWORD"],
+      team_id: ENV["TEAM_ID"]
+    )
+  end
+
+  desc "Build and upload to TestFlight"
+  lane :testflight do
+    # Ensure we have the latest certs
+    sync_certificates
+
+    # Build the app
+    build_app(
+      workspace: "Runner.xcworkspace",
+      scheme: "Runner",
+      export_method: "app-store",
+      export_options: {
+        method: "app-store-connect",
+        teamID: ENV["TEAM_ID"],
+        signingStyle: "automatic",
+        destination: "upload",
+        uploadSymbols: true,
+        stripSwiftSymbols: true
+      },
+      output_directory: "../build/ios/ipa",
+      output_name: "Runner.ipa",
+      clean: true,
+      xcargs: "-allowProvisioningUpdates"
+    )
+
+    # Upload to TestFlight
+    pilot(
+      api_key_path: "../app_store_connect_api_key.json",
+      skip_waiting_for_build_processing: true,
+      changelog: "Build #{ENV['GITHUB_RUN_NUMBER'] || 'local'} from #{`git rev-parse --short HEAD`.strip}"
+    )
+  end
+
+  desc "Build and upload to App Store Connect"
+  lane :appstore do
+    sync_certificates
+
+    build_app(
+      workspace: "Runner.xcworkspace",
+      scheme: "Runner",
+      export_method: "app-store",
+      export_options: {
+        method: "app-store-connect",
+        teamID: ENV["TEAM_ID"],
+        signingStyle: "automatic",
+        destination: "upload",
+        uploadSymbols: true,
+        stripSwiftSymbols: true
+      },
+      output_directory: "../build/ios/ipa",
+      output_name: "Runner.ipa",
+      clean: true,
+      xcargs: "-allowProvisioningUpdates"
+    )
+
+    deliver(
+      api_key_path: "../app_store_connect_api_key.json",
+      skip_metadata: true,
+      skip_screenshots: true,
+      force: true,
+      run_precheck_before_submit: false,
+      submit_for_review: false,
+      automatic_release: false
+    )
+  end
+
+  after_all do |lane|
+    delete_keychain(name: ENV["MATCH_KEYCHAIN_NAME"]) if ENV["MATCH_KEYCHAIN_NAME"]
+  end
+
+  error do |lane, exception|
+    delete_keychain(name: ENV["MATCH_KEYCHAIN_NAME"]) if ENV["MATCH_KEYCHAIN_NAME"]
+    UI.error("Fastlane failed: #{exception.message}")
+  end
+end
