@@ -1,6 +1,12 @@
 import java.util.Properties
 import java.io.FileInputStream
 
+// JVM Toolchain for consistent JVM target across all Kotlin compilation
+// This fixes the tflite_flutter JVM target incompatibility issue
+kotlin {
+    jvmToolchain(17)
+}
+
 plugins {
     id("com.android.application")
     // START: FlutterFire Configuration — declared here but NOT auto-applied;
@@ -59,6 +65,8 @@ android {
 
     kotlinOptions {
         jvmTarget = JavaVersion.VERSION_17.toString()
+        // Ensure consistent JVM target across all modules
+        // This is needed for tflite_flutter and other dependencies
     }
 
     defaultConfig {

@@ -44,3 +44,13 @@ subprojects {
 tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
+
+// Ensure consistent JVM target for ALL subprojects (fixes tflite_flutter)
+// This must be at the end to apply after all plugins are resolved
+subprojects {
+    tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.KotlinJvmOptions.JvmTarget.VERSION_17)
+        }
+    }
+}
