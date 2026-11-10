@@ -1,0 +1,125 @@
+name: iOS Release Build
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build iOS IPA & Upload to TestFlight
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+          working-directory: ./ios
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.19.1'
+          channel: 'stable'
+          cache: true
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Verify Flutter setup
+        run: flutter doctor -v
+
+      - name: Setup iOS signing (Fastlane Match)
+        if: env.MATCH_GIT_URL != ''
+        run: |
+          cd ios
+          bundle exec fastlane match development --readonly || bundle exec fastlane match appstore --readonly
+        env:
+          MATCH_GIT_URL: ${{ secrets.MATCH_GIT_URL }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          MATCH_KEYCHAIN_NAME: ${{ secrets.MATCH_KEYCHAIN_NAME }}
+          MATCH_KEYCHAIN_PASSWORD: ${{ secrets.MATCH_KEYCHAIN_PASSWORD }}
+
+      - name: Build iOS IPA (Release)
+        run: |
+          flutter build ipa --release --no-tree-shake-icons --export-options-plist=ios/ExportOptions.plist
+        env:
+          FLUTTER_BUILD_NUMBER: ${{ github.run_number }}
+          FLUTTER_BUILD_NAME: ${{ github.ref_name }}
+
+      - name: Find IPA artifact
+        id: find-ipa
+        run: |
+          IPA_PATH=$(find build/ios/ipa -name "*.ipa" | head -1)
+          if [ -z "$IPA_PATH" ]; then
+            echo "No IPA found!"
+            exit 1
+          fi
+          echo "ipa_path=$IPA_PATH" >> $GITHUB_OUTPUT
+
+      - name: Upload to TestFlight
+        if: env.APP_STORE_CONNECT_API_KEY != '' && github.event_name == 'push'
+        uses: apple-actions/upload-testflight-build@v1
+        with:
+          app-path: ${{ steps.find-ipa.outputs.ipa_path }}
+          issuer-id: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          api-key-id: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          api-private-key: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+
+      - name: Upload IPA as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: koop-copy-ios-ipa
+          path: ${{ steps.find-ipa.outputs.ipa_path }}
+          retention-days: 30
+
+      - name: Print Build Summary
+        run: |
+          echo "✅ iOS Build Complete!"
+          echo "📦 IPA: ${{ steps.find-ipa.outputs.ipa_path }}"
+          echo "📊 Build #${{ github.run_number }}"
+          echo "🏷️ Version: ${{ github.ref_name }}"
+
+  # Separate job for PR validation (no TestFlight upload)
+  validate-pr:
+    name: Validate iOS Build (PR)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.19.1'
+          channel: 'stable'
+          cache: true
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Run Flutter analyze
+        run: flutter analyze --no-fatal-infos
+
+      - name: Run Flutter tests
+        run: flutter test --coverage
+
+      - name: Build iOS (debug, no signing)
+        run: flutter build ios --debug --no-codesign

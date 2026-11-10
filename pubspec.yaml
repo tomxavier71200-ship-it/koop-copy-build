@@ -515,6 +515,9 @@ dependencies:
   # BLE — flutter_blue_plus is the maintained cross-platform GATT client.
   flutter_blue_plus: ^1.36.8
 
+  # Background compute scheduling (Phase 1: BLE continuous + battery gating)
+  background_fetch: 1.7.0
+
   # Local raw-first storage.
   sqflite: ^2.4.1
   sqflite_common_ffi: ^2.4.0
@@ -667,6 +670,7 @@ dependencies:
   firebase_performance: ^0.11.4+3
   firebase_analytics: ^12.4.3
   google_sign_in: ^7.2.0
+  tflite_flutter: ^0.12.1
 
 # NOTE: to build against the in-tree sibling packages during local development,
 # create a (gitignored) pubspec_overrides.yaml — pub auto-detects it. Keeping the
@@ -750,6 +754,7 @@ flutter:
     # Lucide glyph can't stand in for GitHub/Discord/Reddit's own logos.
     # Official simple-icons SVGs, single fill path, tinted at paint time.
     - assets/icons/
+    - assets/ml/
   # Both families are bundled, not fetched. google_fonts resolves a missing
   # family over HTTP to fonts.gstatic.com on first launch — before the user
   # has seen the consent screen, and contrary to PRIVACY.md. It also lets the
