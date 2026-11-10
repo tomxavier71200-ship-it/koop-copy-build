@@ -40,6 +40,7 @@ import 'ui2/screens/nutrition_screen.dart';
 import 'ui2/screens/wellness_screen.dart';
 import 'ui2/screens/workout_screen.dart';
 import 'ui2/ui2.dart';
+import '../data/db_recalculate.dart' show runFullRecalculation;
 
 class OpenStrapApp extends StatefulWidget {
   const OpenStrapApp({super.key});
@@ -61,6 +62,10 @@ class _OpenStrapAppState extends State<OpenStrapApp> with WidgetsBindingObserver
       final app = context.read<AppState>();
       if (app.isPaired) app.openSession();
     });
+    // Whole-data recalculation on first launch: when the DB algorithm version
+    // differs from the app's current kAlgorithmVersion, recompute ALL days
+    // (including finalized) so the user sees fresh numbers immediately.
+    _firstLaunchRecalculation();
   }
 
   @override
@@ -216,6 +221,25 @@ const String _kOnboarded = 'onboard.completed';
 bool get _onboarded => Prefs.getBool(_kOnboarded, false);
 void _markOnboarded() {
   if (!_onboarded) Prefs.setBool(_kOnboarded, true);
+}
+
+/// First-launch whole-data recalculation trigger.
+///
+/// When the app first runs with a DB that has an older algorithm version than
+/// the app's current kAlgorithmVersion, re-compute ALL days (both finalized and
+/// non-finalized) so the user gets fresh numbers immediately.
+Future<void> _firstLaunchRecalculation() async {
+  final storedVersion = (await Prefs.getInt('last_algorithm_version', 0)) ?? 0;
+  if (storedVersion >= kAlgorithmVersion) return; // already up-to-date
+  // Mark so we don't re-run on every restart
+  await Prefs.setInt('last_algorithm_version', kAlgorithmVersion);
+  // Process ALL days including finalized, so historical data is recomputed
+  await runFullRecalculation(
+    appState: context.read<AppState>(),
+    pacing: DerivePacing(),
+    includeFinalized: true,
+    maxDays: null,
+  );
 }
 
 /// Telemetry-only: the last AppRoute we logged, so the gate's build (which
