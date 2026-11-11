@@ -11,9 +11,6 @@ on:
         options:
           - testflight
           - appstore
-  push:
-    branches: ['release/*', 'main']
-    tags: ['v*']
 
 permissions:
   contents: write
