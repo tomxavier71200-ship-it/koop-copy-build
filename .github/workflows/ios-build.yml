@@ -54,7 +54,9 @@ jobs:
       # cannot re-sign it. Remove the target before Xcode validates signing,
       # instead of deleting its output only after the build.
       - name: Exclude Watch companion from sideload build
-        run: ruby .github/scripts/remove_watch_target.rb
+        run: |
+          gem install xcodeproj
+          ruby .github/scripts/remove_watch_target.rb
 
       - name: Build unsigned iOS app
         # A version that rises on every run (0.10.<run>), so SideStore sees each
