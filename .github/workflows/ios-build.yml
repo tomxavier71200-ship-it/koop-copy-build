@@ -23,12 +23,16 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.3'
+          flutter-version: '3.41.6'
           channel: 'stable'
           cache: true
 
       - name: Show Flutter version
-        run: flutter --version
+        run: |
+          flutter --version
+          dart --version
+          dart pub get --dry-run
+
 
       - name: Configure separate KOOP COPY identity
         run: |
