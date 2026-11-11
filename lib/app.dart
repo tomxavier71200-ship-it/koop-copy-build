@@ -13,6 +13,9 @@ import 'state/app_state.dart';
 import 'state/locale_controller.dart';
 import 'state/prefs.dart';
 import 'telemetry/telemetry_service.dart';
+import 'compute/metric_shims.dart' show kAlgorithmVersion;
+import 'compute/derive_pacing.dart';
+import 'data/db_recalculate.dart' show runFullRecalculation;
 import 'theme/theme_controller.dart';
 import 'theme/theme_switcher.dart';
 import 'widget/widget_service.dart';
@@ -40,7 +43,6 @@ import 'ui2/screens/nutrition_screen.dart';
 import 'ui2/screens/wellness_screen.dart';
 import 'ui2/screens/workout_screen.dart';
 import 'ui2/ui2.dart';
-import '../data/db_recalculate.dart' show runFullRecalculation;
 
 class OpenStrapApp extends StatefulWidget {
   const OpenStrapApp({super.key});
@@ -65,7 +67,19 @@ class _OpenStrapAppState extends State<OpenStrapApp> with WidgetsBindingObserver
     // Whole-data recalculation on first launch: when the DB algorithm version
     // differs from the app's current kAlgorithmVersion, recompute ALL days
     // (including finalized) so the user sees fresh numbers immediately.
-    _firstLaunchRecalculation();
+    // Prefs.getInt returns the stored algorithm version; kAlgorithmVersion is
+    // 58 and lives in metric_shims.dart. If the DB is older, recompute every
+    // day including finalized data so historical numbers are fresh after upgrade.
+    final storedVersion = Prefs.getInt('last_algorithm_version', 0);
+    if (storedVersion < kAlgorithmVersion) {
+      Prefs.setInt('last_algorithm_version', kAlgorithmVersion);
+      runFullRecalculation(
+        appState: context.read<AppState>(),
+        pacing: DerivePacing(background: false),
+        includeFinalized: true,
+        maxDays: null,
+      );
+    }
   }
 
   @override
@@ -221,25 +235,6 @@ const String _kOnboarded = 'onboard.completed';
 bool get _onboarded => Prefs.getBool(_kOnboarded, false);
 void _markOnboarded() {
   if (!_onboarded) Prefs.setBool(_kOnboarded, true);
-}
-
-/// First-launch whole-data recalculation trigger.
-///
-/// When the app first runs with a DB that has an older algorithm version than
-/// the app's current kAlgorithmVersion, re-compute ALL days (both finalized and
-/// non-finalized) so the user gets fresh numbers immediately.
-Future<void> _firstLaunchRecalculation() async {
-  final storedVersion = (await Prefs.getInt('last_algorithm_version', 0)) ?? 0;
-  if (storedVersion >= kAlgorithmVersion) return; // already up-to-date
-  // Mark so we don't re-run on every restart
-  await Prefs.setInt('last_algorithm_version', kAlgorithmVersion);
-  // Process ALL days including finalized, so historical data is recomputed
-  await runFullRecalculation(
-    appState: context.read<AppState>(),
-    pacing: DerivePacing(),
-    includeFinalized: true,
-    maxDays: null,
-  );
 }
 
 /// Telemetry-only: the last AppRoute we logged, so the gate's build (which
