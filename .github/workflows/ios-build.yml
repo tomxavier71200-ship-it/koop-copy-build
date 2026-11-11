@@ -6,8 +6,6 @@ on:
     branches: ['main']
 
 permissions:
-  # write: the job publishes the .ipa and the SideStore source to the
-  # rolling `koop-ios` release so SideStore can offer one-tap updates.
   contents: write
 
 concurrency:
@@ -16,8 +14,6 @@ concurrency:
 
 jobs:
   ios:
-    # macos-latest is ARM64 and has repeatedly failed to acquire a hosted
-    # runner. GitHub documents macos-15-intel as the supported Intel pool.
     runs-on: macos-15-intel
     timeout-minutes: 60
     steps:
@@ -27,12 +23,16 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.19.6'
+          flutter-version: '3.24.3'
           channel: 'stable'
           cache: true
 
+      - name: Show Flutter version
+        run: flutter --version
+
       - name: Configure separate KOOP COPY identity
         run: |
+          mkdir -p ios/Config
           cat > ios/Config/Signing.xcconfig <<'EOF'
           APP_BUNDLE_IDENTIFIER = wtf.openstrap.koopcopy
           APP_WIDGET_BUNDLE_IDENTIFIER = wtf.openstrap.koopcopy.OpenStrapWidget
@@ -40,6 +40,7 @@ jobs:
           EOF
           /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName KOOP COPY' ios/Runner/Info.plist
           /usr/libexec/PlistBuddy -c 'Set :CFBundleName KOOP COPY' ios/Runner/Info.plist
+          cat ios/Config/Signing.xcconfig
 
       - name: Write blank .env
         run: |
@@ -50,35 +51,23 @@ jobs:
         run: dart pub global activate flutterfire_cli 1.4.0
 
       - name: Install dependencies
-        run: flutter pub get --verbose
+        run: flutter pub get
 
       # The sideloaded IPA cannot keep a Watch companion: a free Apple ID
-      # cannot re-sign it. Remove the target before Xcode validates signing,
-      # instead of deleting its output only after the build.
+      # cannot re-sign it. Remove the target before Xcode validates signing.
       - name: Exclude Watch companion from sideload build
         run: |
           gem install xcodeproj
           ruby .github/scripts/remove_watch_target.rb
 
       - name: Build unsigned iOS app
-        # A version that rises on every run (0.10.<run>), so SideStore sees each
-        # push as an update; the pubspec version stays the release line.
-        run: >
-          flutter build ios --release --no-codesign --dart-define-from-file=.env
-          --build-name=0.10.${{ github.run_number }}
-          --build-number=${{ github.run_number }}
-          --verbose
+        run: |
+          flutter build ios --release --no-codesign --dart-define-from-file=.env \
+            --build-name=0.10.${{ github.run_number }} \
+            --build-number=${{ github.run_number }} \
+            --verbose
 
-      # The home-screen widget ships. It used to be stripped: --no-codesign
-      # leaves the .appex with no signature at all, SideStore failed with
-      # "No code signature found", and with no entitlements in the binaries it
-      # could not have known the app and widget share an App Group anyway.
-      # ldid gives both a placeholder signature CARRYING the App Group
-      # entitlement; SideStore reads it, registers the group under the
-      # person's own team (renamed, recorded as ALTAppGroups — which
-      # AppGroup.swift / AppGroupResolver read) and re-signs everything.
-      # Only the widget extension is kept: every extension costs one of a
-      # free Apple ID's three App IDs (SideStore, Koop, widget).
+      # Sign the app and widget with their App Group
       - name: Sign the app and widget with their App Group
         run: |
           set -euo pipefail
@@ -87,7 +76,8 @@ jobs:
           # Verify app exists
           if [ ! -d "$app" ]; then
             echo "ERROR: App not found at $app"
-            ls -la build/ios/iphoneos/
+            ls -la build/ios/iphoneos/ || true
+            find build -name "*.app" -type d 2>/dev/null || true
             exit 1
           fi
           # Keep only the widget extension
@@ -124,13 +114,13 @@ jobs:
           mkdir -p Payload
           cp -R Runner.app Payload/Runner.app
           zip -qr -y "$GITHUB_WORKSPACE/koop-copy-unsigned.ipa" Payload
+          ls -la "$GITHUB_WORKSPACE/koop-copy-unsigned.ipa"
 
       - uses: actions/upload-artifact@v4
         with:
           name: koop-copy-ipa
           path: koop-copy-unsigned.ipa
           retention-days: 14
-
 
       - name: Publish IPA and SideStore source
         env:
