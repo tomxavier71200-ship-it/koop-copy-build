@@ -27,8 +27,9 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          # Same pin as build.yml — verified against this codebase.
-          flutter-version: '3.41.6'
+          flutter-version: '3.19.6'
+          channel: 'stable'
+          cache: true
 
       - name: Configure separate KOOP COPY identity
         run: |
@@ -48,7 +49,8 @@ jobs:
       - name: Install flutterfire (required by Crashlytics Xcode build phase)
         run: dart pub global activate flutterfire_cli 1.4.0
 
-      - run: flutter pub get
+      - name: Install dependencies
+        run: flutter pub get --verbose
 
       # The sideloaded IPA cannot keep a Watch companion: a free Apple ID
       # cannot re-sign it. Remove the target before Xcode validates signing,
@@ -65,6 +67,7 @@ jobs:
           flutter build ios --release --no-codesign --dart-define-from-file=.env
           --build-name=0.10.${{ github.run_number }}
           --build-number=${{ github.run_number }}
+          --verbose
 
       # The home-screen widget ships. It used to be stripped: --no-codesign
       # leaves the .appex with no signature at all, SideStore failed with
@@ -78,8 +81,16 @@ jobs:
       # free Apple ID's three App IDs (SideStore, Koop, widget).
       - name: Sign the app and widget with their App Group
         run: |
+          set -euo pipefail
           brew install ldid
           app=build/ios/iphoneos/Runner.app
+          # Verify app exists
+          if [ ! -d "$app" ]; then
+            echo "ERROR: App not found at $app"
+            ls -la build/ios/iphoneos/
+            exit 1
+          fi
+          # Keep only the widget extension
           find "$app/PlugIns" -mindepth 1 -maxdepth 1 ! -name 'OpenStrapWidgetExtension.appex' -exec rm -rf {} +
           cat > ent.plist <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -91,7 +102,8 @@ jobs:
           EOF
           appex="$app/PlugIns/OpenStrapWidgetExtension.appex"
           if [ -d "$appex" ]; then
-            ldid -Sent.plist "$appex/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$appex/Info.plist")"
+            executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$appex/Info.plist")
+            ldid -Sent.plist "$appex/$executable"
           else
             echo "::warning::widget extension not found in the build"
           fi
@@ -104,6 +116,7 @@ jobs:
             -c "Add :com.apple.developer.healthkit.access array" app-ent.plist
           ldid -Sapp-ent.plist "$app/Runner"
           ldid -e "$app/Runner"
+          echo "Signing complete"
 
       - name: Package unsigned IPA
         run: |
