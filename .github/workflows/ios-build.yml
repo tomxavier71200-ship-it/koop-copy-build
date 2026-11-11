@@ -23,7 +23,7 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.41.6'
+          flutter-version: '3.27.2'
           channel: 'stable'
           cache: true
 
@@ -31,7 +31,6 @@ jobs:
         run: |
           flutter --version
           dart --version
-          dart pub get --dry-run
 
 
       - name: Configure separate KOOP COPY identity
