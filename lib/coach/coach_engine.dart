@@ -870,6 +870,26 @@ class CoachEngine {
             await api.setStepGoal(goal.round());
             return 'Step goal updated.';
           });
+        case 'set_strain_target':
+          return await _action(confirm, ActionRequest(
+            tool: name, title: 'Set strain target',
+            summary: 'Set your daily strain target to ${args['target']}.', args: args,
+          ), () async {
+            final target = CoachActions.num_(args['target']);
+            if (target == null) throw CoachActionError('A strain target must be a number.');
+            await api.setStrainTarget(target.round());
+            return 'Strain target updated.';
+          });
+        case 'set_sleep_need':
+          return await _action(confirm, ActionRequest(
+            tool: name, title: 'Set sleep need',
+            summary: 'Set your sleep need to ${args['minutes']} minutes.', args: args,
+          ), () async {
+            final minutes = CoachActions.num_(args['minutes']);
+            if (minutes == null) throw CoachActionError('Sleep need must be a number of minutes.');
+            await api.setSleepNeed(minutes.round());
+            return 'Sleep need updated.';
+          });
 
         default:
           return 'Unknown tool: $name';
@@ -1109,6 +1129,8 @@ class CoachEngine {
     _fn('start_workout', 'Start a live workout (asks the user to confirm).', {'type': {'type': 'string'}}),
     _fn('end_workout', 'End the active workout (asks the user to confirm).', {'workout_id': {'type': 'string'}}, ['workout_id']),
     _fn('set_step_goal', 'Set the daily step goal (asks the user to confirm).', {'goal': {'type': 'integer'}}, ['goal']),
+    _fn('set_strain_target', 'Set the daily strain target (asks the user to confirm).', {'target': {'type': 'number'}}, ['target']),
+    _fn('set_sleep_need', 'Set the sleep need goal in minutes (asks the user to confirm).', {'minutes': {'type': 'integer'}}, ['minutes']),
   ];
 }
 

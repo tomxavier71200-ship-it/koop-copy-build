@@ -10,6 +10,7 @@
 // every correlation that field appears in for months.
 
 import 'dart:async';
+import 'dart:ui' show VoidCallback, TextAlign, TextBaseline, FontWeight, Canvas, Size, Radius, Offset, Rect, RRect, Paint, TextDirection;
 
 import 'package:flutter/material.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';

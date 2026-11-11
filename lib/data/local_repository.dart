@@ -27,6 +27,12 @@ import 'journal_fields.dart';
 /// triggered for real profile data.
 const int kDefaultStepGoal = 8000;
 
+/// Default strain target (WHOOP's default is around 10-14 depending on recovery)
+const double kDefaultStrainTarget = 12.0;
+
+/// Default sleep need in minutes (8 hours = 480 min)
+const int kDefaultSleepNeedMinutes = 480;
+
 /// Replaces the old ApiClient `ApiException`. Screens catch this to show an
 /// offline / error state. The re-layer can subclass or throw it directly.
 class RepositoryException implements Exception {
@@ -45,6 +51,16 @@ abstract class LocalRepository {
       throw UnimplementedError('re-layer: getProfile');
   Future<Map<String, dynamic>> setStepGoal(int goal) =>
       throw UnimplementedError('re-layer: setStepGoal');
+
+Future<Map<String, dynamic>> setStrainTarget(double target) =>
+      throw UnimplementedError('re-layer: setStrainTarget');
+
+Future<Map<String, dynamic>> setSleepNeedMinutes(int minutes) =>
+      throw UnimplementedError('re-layer: setSleepNeedMinutes');
+  Future<Map<String, dynamic>> setStrainTarget(int target) =>
+      throw UnimplementedError('re-layer: setStrainTarget');
+  Future<Map<String, dynamic>> setSleepNeed(int minutes) =>
+      throw UnimplementedError('re-layer: setSleepNeed');
 
   // ── today / summaries ────────────────────────────────────────────────────────
   Future<Map<String, dynamic>> getToday() =>

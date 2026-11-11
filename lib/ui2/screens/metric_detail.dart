@@ -11,6 +11,8 @@
 
 import 'coach.dart' show CoachScreen;
 import 'package:collection/collection.dart';
+import 'dart:ui' show Color, VoidCallback, TextBaseline, FontWeight, Canvas, Size, Radius, Offset, Rect, RRect, Paint, TextDirection;
+
 import 'package:flutter/material.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:provider/provider.dart';

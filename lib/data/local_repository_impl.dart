@@ -314,6 +314,30 @@ class LocalRepositoryImpl extends LocalRepository {
     return save({'step_goal': goal});
   }
 
+  @override
+  Future<Map<String, dynamic>> setStrainTarget(int target) async {
+    if (target < 1 || target > 21) {
+      throw RepositoryException(400, 'A strain target of $target is out of range (1–21).');
+    }
+    final save = saveProfileFields;
+    if (save == null) {
+      throw RepositoryException(500, 'This process cannot change the profile.');
+    }
+    return save({'strain_target': target});
+  }
+
+  @override
+  Future<Map<String, dynamic>> setSleepNeed(int minutes) async {
+    if (minutes < 360 || minutes > 600) {
+      throw RepositoryException(400, 'A sleep need of $minutes minutes is out of range (360–600).');
+    }
+    final save = saveProfileFields;
+    if (save == null) {
+      throw RepositoryException(500, 'This process cannot change the profile.');
+    }
+    return save({'sleep_need_min': minutes});
+  }
+
   // ── today ─────────────────────────────────────────────────────────────────
   // Shape per lib/models/payloads.dart TodayData: {daily:{…}, sleep:{…},
   // nocturnal:{…}, resp:{…}, hrv:{…}, skin_temp:{…}, step_goal}.
