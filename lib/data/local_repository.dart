@@ -52,8 +52,6 @@ abstract class LocalRepository {
   Future<Map<String, dynamic>> setStepGoal(int goal) =>
       throw UnimplementedError('re-layer: setStepGoal');
 
-Future<Map<String, dynamic>> setStrainTarget(double target) =>
-      throw UnimplementedError('re-layer: setStrainTarget');
 
 Future<Map<String, dynamic>> setSleepNeedMinutes(int minutes) =>
       throw UnimplementedError('re-layer: setSleepNeedMinutes');
