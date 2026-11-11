@@ -1,0 +1,33 @@
+{
+  "name": "KOOP COPY",
+  "identifier": "wtf.openstrap.koopcopy.koop-source",
+  "news": [],
+  "apps": [
+    {
+      "name": "KOOP COPY",
+      "bundleIdentifier": "wtf.openstrap.koopcopy",
+      "developerName": "KOOP COPY",
+      "subtitle": "Your WHOOP band, no subscription",
+      "iconURL": "https://raw.githubusercontent.com/tomxavier71200-ship-it/koop-copy-build/main/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-1024x1024@1x.png",
+      "tintColor": "#1E9BFF",
+      "localizedDescription": "Local-first companion for your WHOOP band. Not affiliated with WHOOP, Inc.",
+      "size": 25125293,
+      "screenshotURLs": [],
+      "version": "0.10.23",
+      "versionDate": "2026-11-11T12:11:29Z",
+      "versionDescription": "KOOP COPY 0.10.23 (build 23).",
+      "downloadURL": "https://github.com/tomxavier71200-ship-it/koop-copy-build/releases/download/koop-copy-ios/koop-copy-23-1.ipa",
+      "versions": [
+        {
+          "version": "0.10.23",
+          "buildVersion": "23",
+          "date": "2026-11-11T12:11:29Z",
+          "localizedDescription": "KOOP COPY 0.10.23 (build 23).",
+          "downloadURL": "https://github.com/tomxavier71200-ship-it/koop-copy-build/releases/download/koop-copy-ios/koop-copy-23-1.ipa",
+          "size": 25125293,
+          "minOSVersion": "15.0"
+        }
+      ]
+    }
+  ]
+}
